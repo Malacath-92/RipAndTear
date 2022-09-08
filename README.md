@@ -5,11 +5,11 @@
     <a href="https://isocpp.org/">
         <img src="https://img.shields.io/badge/language-C%2B%2B20-blue.svg">
     </a>
-    <a href="https://github.com/spelunky-fyi/RipAndTear/actions">
-        <img src="https://github.com/spelunky-fyi/RipAndTear/workflows/Github%20Actions%20CI/badge.svg">
+    <a href="https://github.com/Malacath-92/RipAndTear/actions">
+        <img src="https://github.com/Malacath-92/RipAndTear/workflows/Github%20Actions%20CI/badge.svg">
     </a>
-    <a href="https://github.com/spelunky-fyi/RipAndTear/actions">
-        <img src="https://github.com/spelunky-fyi/RipAndTear/workflows/Formatting/badge.svg">
+    <a href="https://github.com/Malacath-92/RipAndTear/actions">
+        <img src="https://github.com/Malacath-92/RipAndTear/workflows/Formatting/badge.svg">
     </a>
     <a href="https://opensource.org/licenses/MIT" >
         <img src="https://img.shields.io/apm/l/vim-mode.svg">
@@ -21,7 +21,7 @@ This program rips all assets from the Spelunky 2 executable and shrinks the resu
 ## Build
 Only Windows build is supported:
 ```sh
-git clone git@github.com:spelunky-fyi/RipAndTear.git rip_and_tear
+git clone git@github.com:Malacath-92/RipAndTear.git rip_and_tear
 cd rip_and_tear
 git submodule update --init --recursive
 mkdir build
