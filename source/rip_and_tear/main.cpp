@@ -1,7 +1,7 @@
 #include "util/algorithms.h"
 #include "util/file.h"
-#include "util/on_scope_exit.h"
 #include "util/format.h"
+#include "util/on_scope_exit.h"
 
 #include <Windows.h>
 #include <cstddef>
@@ -86,18 +86,19 @@ int main(int argc, char* argv[])
             std::cin >> options.exe_dir.value();
         }
 
-
         struct SVerboseLogData
         {
             size_t segment_depth{};
 
-            [[nodiscard]] auto push_segment() {
+            [[nodiscard]] auto push_segment()
+            {
                 ++segment_depth;
-                return OnScopeExit([this]() { --segment_depth; });
+                return OnScopeExit([this]()
+                                   { --segment_depth; });
             }
         };
         SVerboseLogData verbose_log_data;
-        auto verbose_print = [v = options.verbose, d = &verbose_log_data.segment_depth]<class... Args>(const char* fmt, Args&&... args)
+        auto verbose_print = [ v = options.verbose, d = &verbose_log_data.segment_depth ]<class... Args>(const char* fmt, Args&&... args)
         {
             if (v)
             {
@@ -181,7 +182,7 @@ int main(int argc, char* argv[])
 
                 // Align to the value specified in the header
                 relocation_offset = bundle_size & ~(static_cast<size_t>(image_optional_header.FileAlignment) - 1);
-                
+
                 verbose_print("Found data bundle of size {:#x}...", bundle_size);
                 verbose_print("Aligning to {:#x} bytes, resulting in {:#x}...", image_optional_header.FileAlignment, relocation_offset);
 
@@ -258,7 +259,8 @@ int main(int argc, char* argv[])
             std::byte* const last_section_end{ last_section_start + last_section_size };
             std::byte* const exe_end{ exe_contents.data() + exe_contents.size() };
             const ptrdiff_t leftover_size{ exe_end - last_section_end };
-            if (leftover_size != static_cast<ptrdiff_t>(relocation_offset));
+            if (leftover_size != static_cast<ptrdiff_t>(relocation_offset))
+                ;
             auto memzcmp = [](void* memory, ptrdiff_t size)
             {
                 std::byte* const memory_bytes{ static_cast<std::byte*>(memory) };
@@ -270,21 +272,23 @@ int main(int argc, char* argv[])
                     }
                 }
                 return true;
-                //const size_t zero{};
-                //std::byte* const memory_bytes{ static_cast<std::byte*>(memory) };
-                //const int32_t first_eight_bytes{ std::memcmp(memory, &zero, 8) };
-                //if (first_eight_bytes == 0)
+                // const size_t zero{};
+                // std::byte* const memory_bytes{ static_cast<std::byte*>(memory) };
+                // const int32_t first_eight_bytes{ std::memcmp(memory, &zero, 8) };
+                // if (first_eight_bytes == 0)
                 //{
-                //    const int32_t staggered_bytes{ std::memcmp(memory_bytes, memory_bytes + 8, size - 8) };
-                //    return staggered_bytes == 0;
-                //}
-                //return false;
+                //     const int32_t staggered_bytes{ std::memcmp(memory_bytes, memory_bytes + 8, size - 8) };
+                //     return staggered_bytes == 0;
+                // }
+                // return false;
             };
             assert(memzcmp(last_section_end, leftover_size));
         }
 #endif
 
+        // TODO: Find absolute addresses in binary and patch those
         // TODO: Check which image dos header members need to change
+        // TODO: Patch function reading assets (https://gist.github.com/iojon/0bb1e95bad8b601025bfac14e07d8b25)
 
         (void)image_dos_header;
         (void)image_optional_header;
