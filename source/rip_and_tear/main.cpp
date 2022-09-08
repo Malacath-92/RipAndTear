@@ -128,17 +128,17 @@ int main(int argc, char* argv[])
             return FAILED_GAME_EXE_IS_NOT_A_FILE;
         }
 
-        std::vector<std::byte> exe_contents{ ReadWholeFile(exe_path) };
+        std::vector<std::byte> exe_data{ ReadWholeFile(exe_path) };
 
         verbose_print("Trying to load executable '{}'...", exe_path.string());
-        if (exe_contents.empty())
+        if (exe_data.empty())
         {
             fmt::print("File '{}' could not be loaded...", exe_path.string());
             return FAILED_LOADING_GAME_EXE;
         }
 
         verbose_print("Begin patching image...");
-        void* data_current{ exe_contents.data() };
+        void* data_current{ exe_data.data() };
 
         using namespace std::string_view_literals;
         using DOS_STUB = std::array<std::byte, 56>;
@@ -177,7 +177,7 @@ int main(int argc, char* argv[])
 
                 // Compute bundle size
                 const size_t bundle_data_offset{ header.PointerToRawData };
-                std::byte* const bundle_data_start{ exe_contents.data() + bundle_data_offset };
+                std::byte* const bundle_data_start{ exe_data.data() + bundle_data_offset };
                 const size_t bundle_size{ get_data_bunde_size(bundle_data_start) };
 
                 // Align to the value specified in the header
@@ -219,8 +219,8 @@ int main(int argc, char* argv[])
 
                 // Move the whole section up by the aligned size of the bundle
                 const size_t section_offset{ header.PointerToRawData };
-                std::byte* const section_start{ exe_contents.data() + section_offset };
-                std::byte* const section_end{ exe_contents.data() + section_offset + header.SizeOfRawData };
+                std::byte* const section_start{ exe_data.data() + section_offset };
+                std::byte* const section_end{ exe_data.data() + section_offset + header.SizeOfRawData };
                 header.VirtualAddress = static_cast<DWORD>(header.VirtualAddress - relocation_offset);
                 header.PointerToRawData = static_cast<DWORD>(header.PointerToRawData - relocation_offset);
                 std::memmove(section_start - relocation_offset, section_start, header.SizeOfRawData);
@@ -252,42 +252,44 @@ int main(int argc, char* argv[])
 #ifndef DEBUG
         {
             verbose_print("Verifying that all data was moved...");
+            auto debug_popper = verbose_log_data.push_segment();
 
             const size_t last_section_offset{ image_section_headers.back().PointerToRawData };
             const size_t last_section_size{ image_section_headers.back().SizeOfRawData };
-            std::byte* const last_section_start{ exe_contents.data() + last_section_offset };
+            std::byte* const last_section_start{ exe_data.data() + last_section_offset };
             std::byte* const last_section_end{ last_section_start + last_section_size };
-            std::byte* const exe_end{ exe_contents.data() + exe_contents.size() };
+            std::byte* const exe_end{ exe_data.data() + exe_data.size() };
             const ptrdiff_t leftover_size{ exe_end - last_section_end };
             if (leftover_size != static_cast<ptrdiff_t>(relocation_offset))
-                ;
+            {
+                verbose_print("Warning: Additional data left at end of executable, leftover {:#x} bytes...", leftover_size - static_cast<ptrdiff_t>(relocation_offset));
+            }
             auto memzcmp = [](void* memory, ptrdiff_t size)
             {
+                const size_t zero{};
                 std::byte* const memory_bytes{ static_cast<std::byte*>(memory) };
-                for (ptrdiff_t i = 0; i < size; i++)
+                const int32_t first_eight_bytes{ std::memcmp(memory, &zero, 8) };
+                if (first_eight_bytes == 0)
                 {
-                    if (memory_bytes[i] != std::byte{})
-                    {
-                        return false;
-                    }
+                    const int32_t staggered_bytes{ std::memcmp(memory_bytes, memory_bytes + 8, size - 8) };
+                    return staggered_bytes == 0;
                 }
-                return true;
-                // const size_t zero{};
-                // std::byte* const memory_bytes{ static_cast<std::byte*>(memory) };
-                // const int32_t first_eight_bytes{ std::memcmp(memory, &zero, 8) };
-                // if (first_eight_bytes == 0)
-                //{
-                //     const int32_t staggered_bytes{ std::memcmp(memory_bytes, memory_bytes + 8, size - 8) };
-                //     return staggered_bytes == 0;
-                // }
-                // return false;
+                return false;
             };
-            assert(memzcmp(last_section_end, leftover_size));
+            if (!memzcmp(last_section_end, leftover_size))
+            {
+                verbose_print("Warning: Not all data past the relocated executable is nulled out...");
+            }
         }
 #endif
+        {
+            const size_t last_section_offset{ image_section_headers.back().PointerToRawData };
+            const size_t last_section_size{ image_section_headers.back().SizeOfRawData };
+            exe_data.resize(last_section_offset + last_section_size);
+        }
 
         // TODO: Find absolute addresses in binary and patch those
-        // TODO: Check which image dos header members need to change
+        // TODO: Check which image dos header members need to change (?page size?)
         // TODO: Patch function reading assets (https://gist.github.com/iojon/0bb1e95bad8b601025bfac14e07d8b25)
 
         (void)image_dos_header;
