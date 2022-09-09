@@ -104,6 +104,18 @@ size_t get_data_bunde_size(const void* bundle_start)
     return bundle_size;
 }
 
+std::byte* find_pattern(std::span<std::byte> executable, std::string_view pattern)
+{
+    for (size_t i = 0; i < executable.size() - pattern.size(); i++)
+    {
+        if (std::memcmp(executable.data() + i, pattern.data(), pattern.size()) == 0)
+        {
+            return executable.data() + i;
+        }
+    }
+    return nullptr;
+}
+
 expected<std::filesystem::path> get_exe_path(const CommandLineOptions& options)
 {
     namespace fs = std::filesystem;
@@ -471,61 +483,57 @@ void patch_absolute_addresses(Logger logger,
 
     logger.verbose("Patching main function...");
     auto patch_main_popper = logger.push_segment();
+
     constexpr std::string_view pattern_before_virtual_lock{ "\xba\x00\x00\x00\x40\x41\xb8\x00\x00\x00\x80"sv };
-    for (size_t i = 0; i < executable.size(); i++)
+    if (std::byte* target_addr = find_pattern(executable, pattern_before_virtual_lock))
     {
-        if (i > (executable.size() - pattern_before_virtual_lock.size()))
+        // Find next call
+        while (*target_addr != std::byte{ 0xff })
         {
-            return Error{
-                "Could not patch main function...",
-                FAILED_PATCHING_MAIN_FUNCTION,
-            };
+            *target_addr;
         }
+        // Skip the call
+        target_addr += 6;
 
-        // Find the pattern
-        if (std::memcmp(executable.data() + i, pattern_before_virtual_lock.data(), pattern_before_virtual_lock.size()) == 0)
+        // Expected following instructions:
+        // MOV EDX, dword ptr [g_DataBundleSize]
+        // LEA RCX, [g_DataBundle]
+        // CALL qword ptr[->KERNEL32.DLL::VirtualLock]
+        //          which mean
+        // VirtualLock(&g_DataBundle, g_DataBundleSize)
+        //          equal to 19 bytes in 1.25.2
+        // 8b 15 cd 19 16 00
+        // 48 8d 0d 1e 92 38 dd
+        // ff 15 c0 45 0d 00
+        //          or more generally
+        // 8b 15 ** ** ** **
+        // 48 8d 0d ** ** ** **
+        // ff 15 ** ** ** **
+
+        // We just nop all of this
+
+        logger.verbose("Found VirtualLock call in main, replacing with nop...");
+
+        constexpr std::string_view new_code{
+            "\x66\x0F\x1F\x84\x00\x00\x00\x00\x00" // 9 byte NOP
+            "\x66\x0F\x1F\x84\x00\x00\x00\x00\x00" // 9 byte NOP
+            "\x90"sv                               // 1 byte NOP
+        };
+        static_assert(new_code.size() == 19);
+        std::memcpy(target_addr, new_code.data(), new_code.size());
+
+        if (debug_int)
         {
-            // Find next call
-            while (executable[i] != std::byte{ 0xff })
-            {
-                ++i;
-            }
-            // Skip the call
-            i += 6;
-
-            // Expected following instructions:
-            // MOV EDX, dword ptr [g_DataBundleSize]
-            // LEA RCX, [g_DataBundle]
-            // CALL qword ptr[->KERNEL32.DLL::VirtualLock]
-            //          equal to 19 bytes in 1.25.2
-            // 8b 15 cd 19 16 00
-            // 48 8d 0d 1e 92 38 dd
-            // ff 15 c0 45 0d 00
-            //          or more generally
-            // 8b 15 ** ** ** **
-            // 48 8d 0d ** ** ** **
-            // ff 15 ** ** ** **
-
-            // We just nop all of this
-
-            logger.verbose("Found VirtualLock call in main, replacing with nop...");
-
-            constexpr std::string_view new_code{
-                "\x66\x0F\x1F\x84\x00\x00\x00\x00\x00" // 9 byte NOP
-                "\x66\x0F\x1F\x84\x00\x00\x00\x00\x00" // 9 byte NOP
-                "\x90"sv                               // 1 byte NOP
-            };
-            static_assert(new_code.size() == 19);
-            std::memcpy(executable.data() + i, new_code.data(), new_code.size());
-
-            if (debug_int)
-            {
-                logger.verbose("Writing 'int3' instruction at the beginning of patched code in main...");
-                executable[i] = std::byte{ '\xcc' };
-            }
-
-            break;
+            logger.verbose("Writing 'int3' instruction at the beginning of patched code in main...");
+            *target_addr = std::byte{ '\xcc' };
         }
+    }
+    else
+    {
+        return Error{
+            "Could not patch main function...",
+            FAILED_PATCHING_MAIN_FUNCTION,
+        };
     }
 
     return std::monostate{};
