@@ -1,7 +1,9 @@
+#include "unwind_info.h"
 #include "util/algorithms.h"
 #include "util/file.h"
 #include "util/format.h"
 #include "util/on_scope_exit.h"
+#include "util/span_util.h"
 
 #include <Windows.h>
 #include <cstddef>
@@ -22,25 +24,37 @@ enum ExitReason : int32_t
     FAILED_LOADING_GAME_EXE,
     FAILED_32BIT_EXE_NOT_SUPPORTED,
     FAILED_NO_TEXT_SECTION_FOUND,
+    FAILED_PATCHING_MAIN_FUNCTION,
 };
 
 struct CommandLineOptions
 {
     std::optional<std::string> exe_dir;
+    std::optional<std::string> output_name{ "Tear2.exe" };
     std::optional<int32_t> exit_reason;
     std::optional<bool> verbose{ false };
 };
-VISITABLE_STRUCT(CommandLineOptions, exe_dir, exit_reason, verbose);
+VISITABLE_STRUCT(CommandLineOptions, exe_dir, output_name, exit_reason, verbose);
 
-template<class T>
-[[nodiscard]] T* get_ptr_and_advance(void*& data, size_t num_elements)
+template<class T, class U>
+[[nodiscard]] T* get_ptr(U* const data)
 {
-    T* ptr{ reinterpret_cast<T*>(data) };
-    data = reinterpret_cast<void*>(reinterpret_cast<size_t>(data) + sizeof(T) * num_elements);
+    return reinterpret_cast<T*>(data);
+};
+template<class T, class U>
+[[nodiscard]] T* get_ptr_and_advance(U*& data, size_t num_elements)
+{
+    T* ptr{ get_ptr<T>(data) };
+    data = reinterpret_cast<U*>(reinterpret_cast<size_t>(data) + sizeof(T) * num_elements);
     return ptr;
 };
-template<class T>
-[[nodiscard]] T& get_ref_and_advance(void*& data)
+template<class T, class U>
+[[nodiscard]] T& get_ref(U* const data)
+{
+    return *get_ptr<T>(data);
+};
+template<class T, class U>
+[[nodiscard]] T& get_ref_and_advance(U*& data)
 {
     return *get_ptr_and_advance<T>(data, 1);
 };
@@ -159,83 +173,291 @@ int main(int argc, char* argv[])
         };
 
         verbose_print("Extracted image headers...");
-        auto image_headers_popper = verbose_log_data.push_segment();
 
-        verbose_print("Begin patching headers...");
-
-        // Extract resource bundle and shift all sections
         size_t text_section_start{};
         size_t relocation_offset{};
         std::vector<std::byte> bundle_data{};
-        for (IMAGE_SECTION_HEADER& header : image_section_headers)
+
         {
-            if (bundle_data.empty() && (const char*)header.Name == ".text"sv)
+            verbose_print("Begin patching headers and relocating sections...");
+            auto image_headers_popper = verbose_log_data.push_segment();
+
+            // Extract resource bundle and shift all sections
+            for (IMAGE_SECTION_HEADER& header : image_section_headers)
             {
-                verbose_print("Found .text section...");
-                auto text_header_popper = verbose_log_data.push_segment();
-                verbose_print("Extracting data bundle...");
+                if (bundle_data.empty() && (const char*)header.Name == ".text"sv)
+                {
+                    verbose_print("Found .text section...");
+                    auto text_header_popper = verbose_log_data.push_segment();
+                    verbose_print("Extracting data bundle...");
 
-                // Compute bundle size
-                const size_t bundle_data_offset{ header.PointerToRawData };
-                std::byte* const bundle_data_start{ exe_data.data() + bundle_data_offset };
-                const size_t bundle_size{ get_data_bunde_size(bundle_data_start) };
+                    // Compute bundle size
+                    const size_t bundle_data_offset{ header.PointerToRawData };
+                    std::byte* const bundle_data_start{ exe_data.data() + bundle_data_offset };
+                    const size_t bundle_size{ get_data_bunde_size(bundle_data_start) };
 
-                // Align to the value specified in the header
-                relocation_offset = bundle_size & ~(static_cast<size_t>(image_optional_header.FileAlignment) - 1);
+                    // Align to the value specified in the header
+                    relocation_offset = bundle_size & ~(static_cast<size_t>(image_optional_header.FileAlignment) - 1);
 
-                verbose_print("Found data bundle of size {:#x}...", bundle_size);
-                verbose_print("Aligning to {:#x} bytes, resulting in {:#x}...", image_optional_header.FileAlignment, relocation_offset);
+                    verbose_print("Found data bundle of size {:#x}...", bundle_size);
+                    verbose_print("Aligning to {:#x} bytes, resulting in {:#x}...", image_optional_header.FileAlignment, relocation_offset);
 
-                // Move bundle into it's own data
-                bundle_data.resize(bundle_size);
-                std::memmove(bundle_data.data(), bundle_data_start, bundle_size);
-                std::memset(bundle_data_start, 0, bundle_size);
+                    // Move bundle into it's own data
+                    bundle_data.resize(bundle_size);
+                    std::memmove(bundle_data.data(), bundle_data_start, bundle_size);
+                    std::memset(bundle_data_start, 0, bundle_size);
 
-                verbose_print("Extracted data bundle...");
-                verbose_print("Relocating {} section...", (const char*)header.Name);
+                    verbose_print("Extracted data bundle...");
+                    verbose_print("Relocating {} section...", (const char*)header.Name);
 
-                // Move the old data up by size of the bundle
-                const size_t remaining_text_size{ header.SizeOfRawData - relocation_offset };
-                header.Misc.VirtualSize = static_cast<DWORD>(header.Misc.VirtualSize - relocation_offset);
-                header.VirtualAddress = static_cast<DWORD>(header.VirtualAddress - relocation_offset);
-                header.SizeOfRawData = static_cast<DWORD>(header.SizeOfRawData - relocation_offset);
-                std::memmove(bundle_data_start, bundle_data_start + relocation_offset, remaining_text_size);
-                std::memset(bundle_data_start + remaining_text_size, 0, relocation_offset);
+                    // Move the old data up by size of the bundle
+                    const size_t remaining_text_size{ header.SizeOfRawData - relocation_offset };
+                    header.Misc.VirtualSize = static_cast<DWORD>(header.Misc.VirtualSize - relocation_offset);
+                    header.SizeOfRawData = static_cast<DWORD>(header.SizeOfRawData - relocation_offset);
+                    std::memmove(bundle_data_start, bundle_data_start + relocation_offset, remaining_text_size);
+                    std::memset(bundle_data_start + remaining_text_size, 0, relocation_offset);
 
-                verbose_print("Fixing image optional header...");
+                    verbose_print("Fixing image optional header...");
 
-                // Fix up the header
-                image_optional_header.SizeOfCode = static_cast<DWORD>(image_optional_header.SizeOfCode - relocation_offset);
-                image_optional_header.AddressOfEntryPoint = static_cast<DWORD>(image_optional_header.AddressOfEntryPoint - relocation_offset);
+                    // Fix up the header
+                    image_optional_header.SizeOfImage = static_cast<DWORD>(image_optional_header.SizeOfImage - relocation_offset);
+                    image_optional_header.SizeOfCode = static_cast<DWORD>(image_optional_header.SizeOfCode - relocation_offset);
+                    image_optional_header.AddressOfEntryPoint = static_cast<DWORD>(image_optional_header.AddressOfEntryPoint - relocation_offset);
 
-                // Remember the start of the .text section
-                text_section_start = bundle_data_offset;
+                    // Remember the start of the .text section
+                    text_section_start = bundle_data_offset;
+                }
+                else if (text_section_start > 0)
+                {
+                    verbose_print("Found {} section...", (const char*)header.Name);
+                    auto section_header_popper = verbose_log_data.push_segment();
+                    verbose_print("Relocating section...");
+
+                    // Move the whole section up by the aligned size of the bundle
+                    const size_t section_offset{ header.PointerToRawData };
+                    std::byte* const section_start{ exe_data.data() + section_offset };
+                    std::byte* const section_end{ exe_data.data() + section_offset + header.SizeOfRawData };
+                    header.VirtualAddress = static_cast<DWORD>(header.VirtualAddress - relocation_offset);
+                    header.PointerToRawData = static_cast<DWORD>(header.PointerToRawData - relocation_offset);
+                    std::memmove(section_start - relocation_offset, section_start, header.SizeOfRawData);
+                    std::byte* const new_section_end{ section_start - relocation_offset + header.SizeOfRawData };
+                    std::byte* const zero_memory_begin{ std::max(section_start, new_section_end) };
+                    const size_t zero_memory_size{ static_cast<size_t>(section_end - zero_memory_begin) };
+                    std::memset(zero_memory_begin, 0, zero_memory_size);
+                }
+                else
+                {
+                    verbose_print("Warning: .text segment is not the first segment, some data may be corrupt...");
+                }
             }
-            else if (text_section_start > 0)
-            {
-                verbose_print("Found {} section...", (const char*)header.Name);
-                auto section_header_popper = verbose_log_data.push_segment();
-                verbose_print("Relocating section...");
-
-                // Move the whole section up by the aligned size of the bundle
-                const size_t section_offset{ header.PointerToRawData };
-                std::byte* const section_start{ exe_data.data() + section_offset };
-                std::byte* const section_end{ exe_data.data() + section_offset + header.SizeOfRawData };
-                header.VirtualAddress = static_cast<DWORD>(header.VirtualAddress - relocation_offset);
-                header.PointerToRawData = static_cast<DWORD>(header.PointerToRawData - relocation_offset);
-                std::memmove(section_start - relocation_offset, section_start, header.SizeOfRawData);
-                std::byte* const new_section_end{ section_start - relocation_offset + header.SizeOfRawData };
-                std::byte* const zero_memory_begin{ std::max(section_start, new_section_end) };
-                const size_t zero_memory_size{ static_cast<size_t>(section_end - zero_memory_begin) };
-                std::memset(zero_memory_begin, 0, zero_memory_size);
-            }
-
-            // TODO: Special treatment for segments
         }
 
         if (text_section_start == 0)
         {
             return FAILED_NO_TEXT_SECTION_FOUND;
+        }
+
+        {
+            verbose_print("Patching relative virtual addresses in sections...");
+            auto patch_sections_popper = verbose_log_data.push_segment();
+            for (IMAGE_SECTION_HEADER& header : image_section_headers)
+            {
+                verbose_print("Patching {}...", (const char*)header.Name);
+                auto patch_section_popper = verbose_log_data.push_segment();
+
+                const size_t section_offset{ header.PointerToRawData };
+                const size_t section_size{ header.SizeOfRawData };
+                std::byte* section_data = exe_data.data() + section_offset;
+
+                if ((const char*)header.Name == ".pdata"sv)
+                {
+                    verbose_print("Patching runtime function entries...");
+
+                    std::span<IMAGE_RUNTIME_FUNCTION_ENTRY> image_runtime_function_array{
+                        span::bit_cast<IMAGE_RUNTIME_FUNCTION_ENTRY>(std::span<std::byte>{ section_data, section_size }),
+                    };
+                    for (IMAGE_RUNTIME_FUNCTION_ENTRY& image_runtime_function_entry : image_runtime_function_array)
+                    {
+                        if (image_runtime_function_entry.BeginAddress == 0)
+                        {
+                            break;
+                        }
+
+                        image_runtime_function_entry.BeginAddress = static_cast<DWORD>(image_runtime_function_entry.BeginAddress - relocation_offset);
+                        image_runtime_function_entry.EndAddress = static_cast<DWORD>(image_runtime_function_entry.EndAddress - relocation_offset);
+                        image_runtime_function_entry.UnwindInfoAddress = static_cast<DWORD>(image_runtime_function_entry.UnwindInfoAddress - relocation_offset);
+
+                        const size_t unwind_info_offset{ image_runtime_function_entry.UnwindInfoAddress };
+                        std::byte* const unwind_info_data = exe_data.data() + unwind_info_offset;
+                        UNWIND_INFO& unwind_info{ get_ref<UNWIND_INFO>(unwind_info_data) };
+                        if (unwind_info.Flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER))
+                        {
+                            ULONG& except_handler_offset = *(PULONG)GetLanguageSpecificDataPtr(&unwind_info);
+                            except_handler_offset = static_cast<ULONG>(except_handler_offset - relocation_offset);
+                        }
+                        else if (unwind_info.Flags & UNW_FLAG_CHAININFO)
+                        {
+                            ULONG& chain_info_offset = *(PULONG)GetLanguageSpecificDataPtr(&unwind_info);
+                            chain_info_offset = static_cast<ULONG>(chain_info_offset - relocation_offset);
+                        }
+                    }
+
+                    // TODO: More to do here?
+                }
+                else if ((const char*)header.Name == ".rsrc"sv)
+                {
+                    verbose_print("Patching resource directory...");
+                    auto res_section_popper = verbose_log_data.push_segment();
+
+                    std::byte* const section_start{ section_data };
+                    auto patch_directory_recursive = [&](std::byte* directory_data, auto& self) -> void
+                    {
+                        IMAGE_RESOURCE_DIRECTORY& resource_directory = get_ref_and_advance<IMAGE_RESOURCE_DIRECTORY>(directory_data);
+                        for (size_t i = 0; i < resource_directory.NumberOfNamedEntries + resource_directory.NumberOfIdEntries; i++)
+                        {
+                            IMAGE_RESOURCE_DIRECTORY_ENTRY& resource_entry = get_ref_and_advance<IMAGE_RESOURCE_DIRECTORY_ENTRY>(directory_data);
+
+                            const bool named{ i < resource_directory.NumberOfNamedEntries };
+                            if (named)
+                            {
+                                if (resource_entry.NameIsString)
+                                {
+                                    std::byte* const name_address{ section_start + resource_entry.NameOffset };
+                                    IMAGE_RESOURCE_DIR_STRING_U& name{ get_ref<IMAGE_RESOURCE_DIR_STRING_U>(name_address) };
+                                    const std::string name_utf8{ algo::to_utf8(std::wstring{ name.NameString, name.Length }) };
+                                    verbose_print("Named: {}", name_utf8);
+                                }
+                                else
+                                {
+                                    verbose_print("Named: {}", (DWORD)resource_entry.NameOffset);
+                                }
+                            }
+                            else
+                            {
+                                verbose_print("Id: {}", resource_entry.Id);
+                            }
+
+                            if (resource_entry.DataIsDirectory)
+                            {
+                                auto dir_popper = verbose_log_data.push_segment();
+                                self(section_start + resource_entry.OffsetToDirectory, self);
+                            }
+                            else
+                            {
+                                std::byte* const data_address{ section_start + resource_entry.OffsetToData };
+                                IMAGE_RESOURCE_DATA_ENTRY& data_entry{ get_ref<IMAGE_RESOURCE_DATA_ENTRY>(data_address) };
+                                data_entry.OffsetToData = static_cast<DWORD>(data_entry.OffsetToData - relocation_offset);
+                            }
+                        }
+                    };
+                    verbose_print("Root");
+                    auto root_popper = verbose_log_data.push_segment();
+                    patch_directory_recursive(section_data, patch_directory_recursive);
+                }
+                else if ((const char*)header.Name == ".reloc"sv)
+                {
+                    verbose_print("Patching relocation table...");
+
+                    while (true)
+                    {
+                        DWORD& page_offset{ get_ref_and_advance<DWORD>(section_data) };
+                        if (page_offset > 0)
+                        {
+                            page_offset = static_cast<DWORD>(page_offset - relocation_offset);
+                            DWORD& reloc_block_size{ get_ref_and_advance<DWORD>(section_data) };
+                            section_data += reloc_block_size - sizeof(page_offset) - sizeof(reloc_block_size);
+                        }
+                        else
+                        {
+                            break;
+                        }
+                    }
+                }
+                else
+                {
+                    verbose_print("No work to be done...");
+                }
+            }
+        }
+
+        {
+            verbose_print("Patching absolute addresses in sections...");
+            auto patch_sections_popper = verbose_log_data.push_segment();
+            for (IMAGE_SECTION_HEADER& header : image_section_headers)
+            {
+                verbose_print("Patching {}...", (const char*)header.Name);
+                auto patch_section_popper = verbose_log_data.push_segment();
+
+                const size_t section_offset{ header.PointerToRawData };
+                const size_t section_size{ header.SizeOfRawData };
+                std::byte* section_data = exe_data.data() + section_offset;
+
+                constexpr size_t absolute_memory_range_lower{ 0x162000000 };
+                constexpr size_t absolute_memory_range_upper{ 0x162ffffff };
+
+                std::span<size_t> image_as_aligned_eight_bytes{
+                    span::bit_cast<size_t>(std::span<std::byte>{ section_data, section_size }),
+                };
+                size_t num_values_patched{};
+                for (size_t& value : image_as_aligned_eight_bytes)
+                {
+                    if (value >= absolute_memory_range_lower && value <= absolute_memory_range_upper)
+                    {
+                        value = value - relocation_offset;
+                        num_values_patched++;
+                    }
+                }
+                verbose_print("Patched {} addresses...", num_values_patched);
+            }
+        }
+
+        {
+            verbose_print("Patching main function...");
+            auto patch_main_popper = verbose_log_data.push_segment();
+            constexpr std::string_view pattern_before_virtual_lock{ "\xba\x00\x00\x00\x40\x41\xb8\x00\x00\x00\x80"sv };
+            for (size_t i = 0; i < exe_data.size(); i++)
+            {
+                if (i > (exe_data.size() - pattern_before_virtual_lock.size()))
+                {
+                    fmt::print("Could not patch main function...");
+                    return FAILED_PATCHING_MAIN_FUNCTION;
+                }
+
+                // Find the pattern
+                if (std::memcmp(exe_data.data() + i, pattern_before_virtual_lock.data(), pattern_before_virtual_lock.size()) == 0)
+                {
+                    // Find next call
+                    while (exe_data[i] != std::byte{ 0xff })
+                    {
+                        ++i;
+                    }
+                    // Skip the call
+                    i += 6;
+
+                    // Expected following instructions:
+                    // MOV EDX, dword ptr [g_DataBundleSize]
+                    // LEA RCX, [g_DataBundle]
+                    // CALL qword ptr[->KERNEL32.DLL::VirtualLock]
+
+                    // Replace with:
+                    // XOR RAX, RAX
+                    // MOV DWORD PTR [g_DataBundleSize], EAX
+                    // MOV QWORD PTR [g_DataBundlePtr], RAX
+                    // NOP DWORD PTR [RAX] # 3-byte NOP
+
+
+                    verbose_print("Found VirtualLock call in main, replacing with nop...");
+
+                    constexpr std::string_view new_code{
+                        "\x48\x31\xC0"
+                        "\x89\x05\xCD\x19\x16\x00"
+                        "\x48\x89\x05\xCD\x19\x16\x00"
+                        "\x0F\x1F\x00"sv
+                    };
+                    std::memcpy(exe_data.data() + i, new_code.data(), new_code.size());
+                    break;
+                }
+            }
         }
 
         verbose_print("Fixing data directories...");
@@ -283,17 +505,46 @@ int main(int argc, char* argv[])
         }
 #endif
         {
+            verbose_print("Resizing binary...");
+            auto resize_popper = verbose_log_data.push_segment();
+
             const size_t last_section_offset{ image_section_headers.back().PointerToRawData };
             const size_t last_section_size{ image_section_headers.back().SizeOfRawData };
-            exe_data.resize(last_section_offset + last_section_size);
+            const size_t total_binary_size{ last_section_offset + last_section_size };
+            verbose_print("Old size: {:#x}", exe_data.size());
+            verbose_print("New size: {:#x}", total_binary_size);
+            verbose_print("   Saved: {:#x}", exe_data.size() - total_binary_size);
+            exe_data.resize(total_binary_size);
+        }
+
+        {
+            const fs::path out_path{
+                exe_path.parent_path() / options.output_name.value()
+            };
+            verbose_print("Writing out new executable to '{}'...", out_path.string());
+            auto write_popper = verbose_log_data.push_segment();
+
+            if (fs::exists(out_path))
+            {
+                fmt::print("Path '{}' already exists, press any key to override and continue...", out_path.string());
+                std::cin.get();
+                if (fs::exists(out_path))
+                {
+                    fs::remove(out_path);
+                }
+            }
+
+            WriteWholeFile(out_path, exe_data);
         }
 
         // TODO: Find absolute addresses in binary and patch those
         // TODO: Check which image dos header members need to change (?page size?)
         // TODO: Patch function reading assets (https://gist.github.com/iojon/0bb1e95bad8b601025bfac14e07d8b25)
+        // TODO: nop function that calculates the size of the data bundle
+        // TODO: nop 0x22c77de2 -- VirtualLock(&g_DataBundle,(ulonglong)g_DataBundleSize);
+        // TODO: handle some code in GameMain around 0x22c782ef
 
         (void)image_dos_header;
-        (void)image_optional_header;
     }
     catch (structopt::exception& e)
     {

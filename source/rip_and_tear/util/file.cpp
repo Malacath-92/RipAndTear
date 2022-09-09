@@ -29,3 +29,17 @@ std::vector<std::byte> ReadWholeFile(const std::filesystem::path& file_path)
     }
     return {};
 }
+
+bool WriteWholeFile(const std::filesystem::path& file_path, const std::vector<std::byte>& data)
+{
+    FILE* file{ nullptr };
+    errno_t error = _wfopen_s(&file, file_path.c_str(), L"wb");
+    if (error == 0 && file != nullptr)
+    {
+        auto close_file = OnScopeExit{ std::bind_front(fclose, file) };
+
+        fwrite(data.data(), 1, data.size(), file);
+        return true;
+    }
+    return false;
+}
