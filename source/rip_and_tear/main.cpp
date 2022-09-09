@@ -515,9 +515,10 @@ void patch_absolute_addresses(Logger logger,
         logger.verbose("Found VirtualLock call in main, replacing with nop...");
 
         constexpr std::string_view new_code{
+            "\x90"                                 // 1 byte NOP
             "\x66\x0F\x1F\x84\x00\x00\x00\x00\x00" // 9 byte NOP
             "\x66\x0F\x1F\x84\x00\x00\x00\x00\x00" // 9 byte NOP
-            "\x90"sv                               // 1 byte NOP
+            ""sv
         };
         static_assert(new_code.size() == 19);
         std::memcpy(target_addr, new_code.data(), new_code.size());
