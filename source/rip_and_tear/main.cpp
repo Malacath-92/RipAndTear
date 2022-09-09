@@ -539,6 +539,52 @@ void patch_absolute_addresses(Logger logger,
     return std::monostate{};
 }
 
+[[nodiscard]] expected<std::monostate> patch_bundle_init(Logger& logger,
+                                                         std::span<std::byte> executable,
+                                                         bool debug_int)
+{
+    using namespace std::string_view_literals;
+
+    logger.verbose("Patching data bundle init function...");
+    auto patch_bundle_init_popper = logger.push_segment();
+
+    constexpr std::string_view pattern_in_function{ "\x48\xb8\x08\x00\x00\x00\x00\x00\x10\x00"sv };
+    if (std::byte* const function_begin = find_pattern(executable, pattern_in_function))
+    {
+        // TODO: Should use exception handling data to find the range of this function
+
+        // Find the last call in the function
+        if (std::byte* function_end = find_pattern(std::span{ function_begin, 0x10000 }, "\xe9"sv))
+        {
+            // Skip the call
+            function_end += 5;
+
+            constexpr std::string_view new_code{
+                "\x48\xc7\x05\xe1\xda\x14\x00\x00\x00\x00\x00" // MOV qword ptr [g_DataBundleSize], 0x0
+                "\x48\xc7\x05\xe6\xda\x14\x00\x00\x00\x00\x00" // MOV dword ptr [DAT_162dd97b8], 0x0
+                "\x48\x8d\x05\x27\x53\x37\xdd"                 // LEA RAX, [g_DataBundle]
+                "\x48\x89\x05\xd0\xda\x14\x00"                 // MOV qword ptr [g_DataBundlePtr], RAX
+                ""sv
+            };
+            std::memset(function_begin, '\x90', function_end - function_begin);
+            std::memcpy(function_begin, new_code.data(), new_code.size());
+
+            if (debug_int)
+            {
+                logger.verbose("Writing 'int3' instruction at the beginning of patched code in main...");
+                *(function_end - 1) = std::byte{ '\xcc' };
+            }
+
+            return std::monostate{};
+        }
+
+        return Error{
+            "Could not patch bundle init function...",
+            FAILED_PATCHING_BUNDLE_INIT_FUNCTION,
+        };
+    }
+}
+
 void patch_data_directories(Logger& logger,
                             IMAGE_OPTIONAL_HEADER& image_optional_header,
                             size_t text_section_start,
@@ -692,6 +738,10 @@ int main(int argc, char* argv[])
         as_value(patch_main(logger,
                             exe_data,
                             options.insert_debug_interrupts.value_or(false)));
+
+        as_value(patch_bundle_init(logger,
+                                   exe_data,
+                                   options.insert_debug_interrupts.value_or(false)));
 
         patch_data_directories(logger,
                                headers.image_optional_header,
