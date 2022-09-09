@@ -36,6 +36,44 @@ struct CommandLineOptions
 };
 VISITABLE_STRUCT(CommandLineOptions, exe_dir, output_name, exit_reason, verbose);
 
+struct Logger
+{
+    bool is_verbose{};
+    size_t segment_depth{};
+
+    [[nodiscard]] auto push_segment()
+    {
+        ++segment_depth;
+        return OnScopeExit([this]()
+                           { --segment_depth; });
+    }
+
+    template<class... Args>
+    void verbose(const char* fmt, Args&&... args)
+    {
+        if (is_verbose)
+        {
+            fmt::print("{:\t>{}}", "", segment_depth);
+            fmt::print(fmt, std::forward<Args>(args)...);
+            fmt::print("\n");
+        }
+    }
+    template<class... Args>
+    void warning(const char* fmt, Args&&... args)
+    {
+        fmt::print(fmt::fg(fmt::color::yellow), "{:\t>{}}", "Warning: ", segment_depth);
+        fmt::print(fmt::fg(fmt::color::yellow), fmt, std::forward<Args>(args)...);
+        fmt::print("\n");
+    }
+    template<class... Args>
+    void error(const char* fmt, Args&&... args)
+    {
+        fmt::print(fmt::fg(fmt::color::red), "{:\t>{}}", "Error: ", segment_depth);
+        fmt::print(fmt::fg(fmt::color::yellow), fmt, std::forward<Args>(args)...);
+        fmt::print("\n");
+    }
+};
+
 template<class T, class U>
 [[nodiscard]] T* get_ptr(U* const data)
 {
@@ -81,6 +119,7 @@ int main(int argc, char* argv[])
     try
     {
         CommandLineOptions options = structopt::app("Rip & Tear").parse<CommandLineOptions>(argc, argv);
+        Logger logger{ options.verbose.value_or(false) };
 
         if (options.exit_reason.has_value())
         {
@@ -99,28 +138,6 @@ int main(int argc, char* argv[])
             options.exe_dir.emplace();
             std::cin >> options.exe_dir.value();
         }
-
-        struct SVerboseLogData
-        {
-            size_t segment_depth{};
-
-            [[nodiscard]] auto push_segment()
-            {
-                ++segment_depth;
-                return OnScopeExit([this]()
-                                   { --segment_depth; });
-            }
-        };
-        SVerboseLogData verbose_log_data;
-        auto verbose_print = [ v = options.verbose, d = &verbose_log_data.segment_depth ]<class... Args>(const char* fmt, Args&&... args)
-        {
-            if (v)
-            {
-                fmt::print("{:\t>{}}", "", *d);
-                fmt::print(fmt, std::forward<Args>(args)...);
-                fmt::print("\n");
-            }
-        };
 
         namespace fs = std::filesystem;
         const fs::path user_exe_dir{ options.exe_dir.value() };
@@ -144,14 +161,14 @@ int main(int argc, char* argv[])
 
         std::vector<std::byte> exe_data{ ReadWholeFile(exe_path) };
 
-        verbose_print("Trying to load executable '{}'...", exe_path.string());
+        logger.verbose("Trying to load executable '{}'...", exe_path.string());
         if (exe_data.empty())
         {
             fmt::print("File '{}' could not be loaded...", exe_path.string());
             return FAILED_LOADING_GAME_EXE;
         }
 
-        verbose_print("Begin patching image...");
+        logger.verbose("Begin patching image...");
         void* data_current{ exe_data.data() };
 
         using namespace std::string_view_literals;
@@ -172,24 +189,24 @@ int main(int argc, char* argv[])
             get_ptr_and_advance<IMAGE_SECTION_HEADER>(data_current, num_sections), num_sections
         };
 
-        verbose_print("Extracted image headers...");
+        logger.verbose("Extracted image headers...");
 
         size_t text_section_start{};
         size_t relocation_offset{};
         std::vector<std::byte> bundle_data{};
 
         {
-            verbose_print("Begin patching headers and relocating sections...");
-            auto image_headers_popper = verbose_log_data.push_segment();
+            logger.verbose("Begin patching headers and relocating sections...");
+            auto image_headers_popper = logger.push_segment();
 
             // Extract resource bundle and shift all sections
             for (IMAGE_SECTION_HEADER& header : image_section_headers)
             {
                 if (bundle_data.empty() && (const char*)header.Name == ".text"sv)
                 {
-                    verbose_print("Found .text section...");
-                    auto text_header_popper = verbose_log_data.push_segment();
-                    verbose_print("Extracting data bundle...");
+                    logger.verbose("Found .text section...");
+                    auto text_header_popper = logger.push_segment();
+                    logger.verbose("Extracting data bundle...");
 
                     // Compute bundle size
                     const size_t bundle_data_offset{ header.PointerToRawData };
@@ -199,16 +216,16 @@ int main(int argc, char* argv[])
                     // Align to the value specified in the header
                     relocation_offset = bundle_size & ~(static_cast<size_t>(image_optional_header.FileAlignment) - 1);
 
-                    verbose_print("Found data bundle of size {:#x}...", bundle_size);
-                    verbose_print("Aligning to {:#x} bytes, resulting in {:#x}...", image_optional_header.FileAlignment, relocation_offset);
+                    logger.verbose("Found data bundle of size {:#x}...", bundle_size);
+                    logger.verbose("Aligning to {:#x} bytes, resulting in {:#x}...", image_optional_header.FileAlignment, relocation_offset);
 
                     // Move bundle into it's own data
                     bundle_data.resize(bundle_size);
                     std::memmove(bundle_data.data(), bundle_data_start, bundle_size);
                     std::memset(bundle_data_start, 0, bundle_size);
 
-                    verbose_print("Extracted data bundle...");
-                    verbose_print("Relocating {} section...", (const char*)header.Name);
+                    logger.verbose("Extracted data bundle...");
+                    logger.verbose("Relocating {} section...", (const char*)header.Name);
 
                     // Move the old data up by size of the bundle
                     const size_t remaining_text_size{ header.SizeOfRawData - relocation_offset };
@@ -217,7 +234,7 @@ int main(int argc, char* argv[])
                     std::memmove(bundle_data_start, bundle_data_start + relocation_offset, remaining_text_size);
                     std::memset(bundle_data_start + remaining_text_size, 0, relocation_offset);
 
-                    verbose_print("Fixing image optional header...");
+                    logger.verbose("Fixing image optional header...");
 
                     // Fix up the header
                     image_optional_header.SizeOfImage = static_cast<DWORD>(image_optional_header.SizeOfImage - relocation_offset);
@@ -229,9 +246,9 @@ int main(int argc, char* argv[])
                 }
                 else if (text_section_start > 0)
                 {
-                    verbose_print("Found {} section...", (const char*)header.Name);
-                    auto section_header_popper = verbose_log_data.push_segment();
-                    verbose_print("Relocating section...");
+                    logger.verbose("Found {} section...", (const char*)header.Name);
+                    auto section_header_popper = logger.push_segment();
+                    logger.verbose("Relocating section...");
 
                     // Move the whole section up by the aligned size of the bundle
                     const size_t section_offset{ header.PointerToRawData };
@@ -247,7 +264,7 @@ int main(int argc, char* argv[])
                 }
                 else
                 {
-                    verbose_print("Warning: .text segment is not the first segment, some data may be corrupt...");
+                    logger.warning(".text segment is not the first segment, some data may be corrupt...");
                 }
             }
         }
@@ -258,12 +275,12 @@ int main(int argc, char* argv[])
         }
 
         {
-            verbose_print("Patching relative virtual addresses in sections...");
-            auto patch_sections_popper = verbose_log_data.push_segment();
+            logger.verbose("Patching relative virtual addresses in sections...");
+            auto patch_sections_popper = logger.push_segment();
             for (IMAGE_SECTION_HEADER& header : image_section_headers)
             {
-                verbose_print("Patching {}...", (const char*)header.Name);
-                auto patch_section_popper = verbose_log_data.push_segment();
+                logger.verbose("Patching {}...", (const char*)header.Name);
+                auto patch_section_popper = logger.push_segment();
 
                 const size_t section_offset{ header.PointerToRawData };
                 const size_t section_size{ header.SizeOfRawData };
@@ -271,7 +288,7 @@ int main(int argc, char* argv[])
 
                 if ((const char*)header.Name == ".pdata"sv)
                 {
-                    verbose_print("Patching runtime function entries...");
+                    logger.verbose("Patching runtime function entries...");
 
                     std::span<IMAGE_RUNTIME_FUNCTION_ENTRY> image_runtime_function_array{
                         span::bit_cast<IMAGE_RUNTIME_FUNCTION_ENTRY>(std::span<std::byte>{ section_data, section_size }),
@@ -306,8 +323,8 @@ int main(int argc, char* argv[])
                 }
                 else if ((const char*)header.Name == ".rsrc"sv)
                 {
-                    verbose_print("Patching resource directory...");
-                    auto res_section_popper = verbose_log_data.push_segment();
+                    logger.verbose("Patching resource directory...");
+                    auto res_section_popper = logger.push_segment();
 
                     std::byte* const section_start{ section_data };
                     auto patch_directory_recursive = [&](std::byte* directory_data, auto& self) -> void
@@ -325,21 +342,21 @@ int main(int argc, char* argv[])
                                     std::byte* const name_address{ section_start + resource_entry.NameOffset };
                                     IMAGE_RESOURCE_DIR_STRING_U& name{ get_ref<IMAGE_RESOURCE_DIR_STRING_U>(name_address) };
                                     const std::string name_utf8{ algo::to_utf8(std::wstring{ name.NameString, name.Length }) };
-                                    verbose_print("Named: {}", name_utf8);
+                                    logger.verbose("Named: {}", name_utf8);
                                 }
                                 else
                                 {
-                                    verbose_print("Named: {}", (DWORD)resource_entry.NameOffset);
+                                    logger.verbose("Named: {}", (DWORD)resource_entry.NameOffset);
                                 }
                             }
                             else
                             {
-                                verbose_print("Id: {}", resource_entry.Id);
+                                logger.verbose("Id: {}", resource_entry.Id);
                             }
 
                             if (resource_entry.DataIsDirectory)
                             {
-                                auto dir_popper = verbose_log_data.push_segment();
+                                auto dir_popper = logger.push_segment();
                                 self(section_start + resource_entry.OffsetToDirectory, self);
                             }
                             else
@@ -350,13 +367,13 @@ int main(int argc, char* argv[])
                             }
                         }
                     };
-                    verbose_print("Root");
-                    auto root_popper = verbose_log_data.push_segment();
+                    logger.verbose("Root");
+                    auto root_popper = logger.push_segment();
                     patch_directory_recursive(section_data, patch_directory_recursive);
                 }
                 else if ((const char*)header.Name == ".reloc"sv)
                 {
-                    verbose_print("Patching relocation table...");
+                    logger.verbose("Patching relocation table...");
 
                     while (true)
                     {
@@ -375,18 +392,18 @@ int main(int argc, char* argv[])
                 }
                 else
                 {
-                    verbose_print("No work to be done...");
+                    logger.verbose("No work to be done...");
                 }
             }
         }
 
         {
-            verbose_print("Patching absolute addresses in sections...");
-            auto patch_sections_popper = verbose_log_data.push_segment();
+            logger.verbose("Patching absolute addresses in sections...");
+            auto patch_sections_popper = logger.push_segment();
             for (IMAGE_SECTION_HEADER& header : image_section_headers)
             {
-                verbose_print("Patching {}...", (const char*)header.Name);
-                auto patch_section_popper = verbose_log_data.push_segment();
+                logger.verbose("Patching {}...", (const char*)header.Name);
+                auto patch_section_popper = logger.push_segment();
 
                 const size_t section_offset{ header.PointerToRawData };
                 const size_t section_size{ header.SizeOfRawData };
@@ -407,13 +424,13 @@ int main(int argc, char* argv[])
                         num_values_patched++;
                     }
                 }
-                verbose_print("Patched {} addresses...", num_values_patched);
+                logger.verbose("Patched {} addresses...", num_values_patched);
             }
         }
 
         {
-            verbose_print("Patching main function...");
-            auto patch_main_popper = verbose_log_data.push_segment();
+            logger.verbose("Patching main function...");
+            auto patch_main_popper = logger.push_segment();
             constexpr std::string_view pattern_before_virtual_lock{ "\xba\x00\x00\x00\x40\x41\xb8\x00\x00\x00\x80"sv };
             for (size_t i = 0; i < exe_data.size(); i++)
             {
@@ -445,8 +462,7 @@ int main(int argc, char* argv[])
                     // MOV QWORD PTR [g_DataBundlePtr], RAX
                     // NOP DWORD PTR [RAX] # 3-byte NOP
 
-
-                    verbose_print("Found VirtualLock call in main, replacing with nop...");
+                    logger.verbose("Found VirtualLock call in main, replacing with nop...");
 
                     constexpr std::string_view new_code{
                         "\x48\x31\xC0"
@@ -460,7 +476,7 @@ int main(int argc, char* argv[])
             }
         }
 
-        verbose_print("Fixing data directories...");
+        logger.verbose("Fixing data directories...");
 
         // Fix up the data directories
         for (IMAGE_DATA_DIRECTORY& data_directory : image_optional_header.DataDirectory)
@@ -473,8 +489,8 @@ int main(int argc, char* argv[])
 
 #ifndef DEBUG
         {
-            verbose_print("Verifying that all data was moved...");
-            auto debug_popper = verbose_log_data.push_segment();
+            logger.verbose("Verifying that all data was moved...");
+            auto debug_popper = logger.push_segment();
 
             const size_t last_section_offset{ image_section_headers.back().PointerToRawData };
             const size_t last_section_size{ image_section_headers.back().SizeOfRawData };
@@ -484,7 +500,7 @@ int main(int argc, char* argv[])
             const ptrdiff_t leftover_size{ exe_end - last_section_end };
             if (leftover_size != static_cast<ptrdiff_t>(relocation_offset))
             {
-                verbose_print("Warning: Additional data left at end of executable, leftover {:#x} bytes...", leftover_size - static_cast<ptrdiff_t>(relocation_offset));
+                logger.warning("Additional data left at end of executable, leftover {:#x} bytes...", leftover_size - static_cast<ptrdiff_t>(relocation_offset));
             }
             auto memzcmp = [](void* memory, ptrdiff_t size)
             {
@@ -500,20 +516,20 @@ int main(int argc, char* argv[])
             };
             if (!memzcmp(last_section_end, leftover_size))
             {
-                verbose_print("Warning: Not all data past the relocated executable is nulled out...");
+                logger.warning("Not all data past the relocated executable is nulled out...");
             }
         }
 #endif
         {
-            verbose_print("Resizing binary...");
-            auto resize_popper = verbose_log_data.push_segment();
+            logger.verbose("Resizing binary...");
+            auto resize_popper = logger.push_segment();
 
             const size_t last_section_offset{ image_section_headers.back().PointerToRawData };
             const size_t last_section_size{ image_section_headers.back().SizeOfRawData };
             const size_t total_binary_size{ last_section_offset + last_section_size };
-            verbose_print("Old size: {:#x}", exe_data.size());
-            verbose_print("New size: {:#x}", total_binary_size);
-            verbose_print("   Saved: {:#x}", exe_data.size() - total_binary_size);
+            logger.verbose("Old size: {:#x}", exe_data.size());
+            logger.verbose("New size: {:#x}", total_binary_size);
+            logger.verbose("   Saved: {:#x}", exe_data.size() - total_binary_size);
             exe_data.resize(total_binary_size);
         }
 
@@ -521,8 +537,8 @@ int main(int argc, char* argv[])
             const fs::path out_path{
                 exe_path.parent_path() / options.output_name.value()
             };
-            verbose_print("Writing out new executable to '{}'...", out_path.string());
-            auto write_popper = verbose_log_data.push_segment();
+            logger.verbose("Writing out new executable to '{}'...", out_path.string());
+            auto write_popper = logger.push_segment();
 
             if (fs::exists(out_path))
             {
