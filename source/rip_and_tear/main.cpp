@@ -553,7 +553,7 @@ void patch_absolute_addresses(Logger logger,
     constexpr std::string_view pattern_in_function{ "\x48\xb8\x08\x00\x00\x00\x00\x00\x10\x00"sv };
     if (std::byte* const function_begin = find_pattern(executable, pattern_in_function))
     {
-        // TODO: Should use exception handling data to find the range of this function
+        // TODO: Should use exception handling data to find the range of this function ???
 
         // Find the last call in the function
         if (std::byte* function_end = find_pattern(std::span{ function_begin, 0x10000 }, "\xe9"sv))
@@ -765,9 +765,6 @@ int main(int argc, char* argv[])
         // TODO: Find absolute addresses in binary and patch those
         // TODO: Check which image dos header members need to change (?page size?)
         // TODO: Patch function reading assets (https://gist.github.com/iojon/0bb1e95bad8b601025bfac14e07d8b25)
-        // TODO: nop function that calculates the size of the data bundle
-        // TODO: nop 0x22c77de2 -- VirtualLock(&g_DataBundle,(ulonglong)g_DataBundleSize);
-        // TODO: handle some code in GameMain around 0x22c782ef
     }
     catch (const RipException& e)
     {
