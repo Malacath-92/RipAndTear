@@ -20,10 +20,11 @@ struct CommandLineOptions
 {
     std::optional<std::string> exe_dir;
     std::optional<std::string> output_name{ "Tear2.exe" };
+    std::optional<bool> insert_debug_interrupts{ false };
     std::optional<int32_t> exit_reason;
     std::optional<bool> verbose{ false };
 };
-VISITABLE_STRUCT(CommandLineOptions, exe_dir, output_name, exit_reason, verbose);
+VISITABLE_STRUCT(CommandLineOptions, exe_dir, output_name, insert_debug_interrupts, exit_reason, verbose);
 
 struct Logger
 {
@@ -463,7 +464,8 @@ void patch_absolute_addresses(Logger logger,
 }
 
 [[nodiscard]] expected<std::monostate> patch_main(Logger& logger,
-                                                  std::span<std::byte> executable)
+                                                  std::span<std::byte> executable,
+                                                  bool debug_int)
 {
     using namespace std::string_view_literals;
 
@@ -495,22 +497,32 @@ void patch_absolute_addresses(Logger logger,
             // MOV EDX, dword ptr [g_DataBundleSize]
             // LEA RCX, [g_DataBundle]
             // CALL qword ptr[->KERNEL32.DLL::VirtualLock]
+            //          equal to 19 bytes in 1.25.2
+            // 8b 15 cd 19 16 00
+            // 48 8d 0d 1e 92 38 dd
+            // ff 15 c0 45 0d 00
+            //          or more generally
+            // 8b 15 ** ** ** **
+            // 48 8d 0d ** ** ** **
+            // ff 15 ** ** ** **
 
-            // Replace with:
-            // XOR RAX, RAX
-            // MOV DWORD PTR [g_DataBundleSize], EAX
-            // MOV QWORD PTR [g_DataBundlePtr], RAX
-            // NOP DWORD PTR [RAX] # 3-byte NOP
+            // We just nop all of this
 
             logger.verbose("Found VirtualLock call in main, replacing with nop...");
 
             constexpr std::string_view new_code{
-                "\x48\x31\xC0"
-                "\x89\x05\xCD\x19\x16\x00"
-                "\x48\x89\x05\xCD\x19\x16\x00"
-                "\x0F\x1F\x00"sv
+                "\x66\x0F\x1F\x84\x00\x00\x00\x00\x00" // 9 byte NOP
+                "\x66\x0F\x1F\x84\x00\x00\x00\x00\x00" // 9 byte NOP
+                "\x90"sv                               // 1 byte NOP
             };
+            static_assert(new_code.size() == 19);
             std::memcpy(executable.data() + i, new_code.data(), new_code.size());
+
+            if (debug_int)
+            {
+                logger.verbose("Writing 'int3' instruction at the beginning of patched code in main...");
+                executable[i] = std::byte{ '\xcc' };
+            }
 
             break;
         }
@@ -669,7 +681,9 @@ int main(int argc, char* argv[])
                                  bundle_extraction_result.relocation_offset,
                                  exe_data.data());
 
-        as_value(patch_main(logger, exe_data));
+        as_value(patch_main(logger,
+                            exe_data,
+                            options.insert_debug_interrupts.value_or(false)));
 
         patch_data_directories(logger,
                                headers.image_optional_header,
