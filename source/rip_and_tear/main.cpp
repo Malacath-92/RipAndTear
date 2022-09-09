@@ -528,8 +528,10 @@ void patch_absolute_addresses(Logger logger,
         if (debug_int)
         {
             logger.verbose("Writing 'int3' instruction at the beginning of patched code in main...");
-            *target_addr = std::byte{ '\xcc' };
+            *target_addr = std::byte{ 0xcc };
         }
+
+        // Note: there is more code accessing the data bundle in main, but it appears to correctly handle a zero-size bundle
     }
     else
     {
@@ -575,7 +577,7 @@ void patch_absolute_addresses(Logger logger,
             if (debug_int)
             {
                 logger.verbose("Writing 'int3' instruction at the beginning of patched code in main...");
-                *(function_end - 1) = std::byte{ '\xcc' };
+                *(function_end - 1) = std::byte{ 0xcc };
             }
 
             return std::monostate{};
