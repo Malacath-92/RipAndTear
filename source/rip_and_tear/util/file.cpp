@@ -30,7 +30,7 @@ std::vector<std::byte> ReadWholeFile(const std::filesystem::path& file_path)
     return {};
 }
 
-bool WriteWholeFile(const std::filesystem::path& file_path, const std::vector<std::byte>& data)
+bool WriteWholeFile(const std::filesystem::path& file_path, const std::span<std::byte>& data)
 {
     FILE* file{ nullptr };
     errno_t error = _wfopen_s(&file, file_path.c_str(), L"wb");
