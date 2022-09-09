@@ -488,10 +488,7 @@ void patch_absolute_addresses(Logger logger,
     if (std::byte* target_addr = find_pattern(executable, pattern_before_virtual_lock))
     {
         // Find next call
-        while (*target_addr != std::byte{ 0xff })
-        {
-            *target_addr;
-        }
+        target_addr = find_pattern(executable, "\xff"sv);
         // Skip the call
         target_addr += 6;
 
