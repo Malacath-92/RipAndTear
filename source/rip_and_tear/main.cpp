@@ -582,12 +582,12 @@ void patch_absolute_addresses(Logger logger,
 
             return std::monostate{};
         }
-
-        return Error{
-            "Could not patch bundle init function...",
-            FAILED_PATCHING_BUNDLE_INIT_FUNCTION,
-        };
     }
+
+    return Error{
+        "Could not patch bundle init function...",
+        FAILED_PATCHING_BUNDLE_INIT_FUNCTION,
+    };
 }
 
 void patch_data_directories(Logger& logger,
