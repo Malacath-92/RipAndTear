@@ -42,10 +42,10 @@ typedef struct _UNWIND_INFO
     UBYTE FrameOffset : 4;
     UNWIND_CODE UnwindCode[];
     /*  union {
-    *       OPTIONAL ULONG ExceptionHandler;
-    *       OPTIONAL ULONG FunctionEntry;
-    *   };
-    *   OPTIONAL ULONG ExceptionData[]; */
+     *       OPTIONAL ULONG ExceptionHandler;
+     *       OPTIONAL ULONG FunctionEntry;
+     *   };
+     *   OPTIONAL ULONG ExceptionData[]; */
 } UNWIND_INFO, *PUNWIND_INFO;
 
 #define GetUnwindCodeEntry(info, index) \
