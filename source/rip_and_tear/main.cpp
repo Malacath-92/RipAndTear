@@ -1,5 +1,6 @@
 #include "unwind_info.h"
 #include "util/algorithms.h"
+#include "util/error.h"
 #include "util/file.h"
 #include "util/format.h"
 #include "util/on_scope_exit.h"
@@ -14,18 +15,6 @@
 #include <structopt/app.hpp>
 
 #include <magic_enum.hpp>
-
-enum ExitReason : int32_t
-{
-    SUCCESS,
-    FAILED_PARSING_COMMAND_LINE,
-    FAILED_GAME_EXE_DOES_NOT_EXIST,
-    FAILED_GAME_EXE_IS_NOT_A_FILE,
-    FAILED_LOADING_GAME_EXE,
-    FAILED_32BIT_EXE_NOT_SUPPORTED,
-    FAILED_NO_TEXT_SECTION_FOUND,
-    FAILED_PATCHING_MAIN_FUNCTION,
-};
 
 struct CommandLineOptions
 {
@@ -114,6 +103,36 @@ size_t get_data_bunde_size(const void* bundle_start)
     return bundle_size;
 }
 
+expected<std::filesystem::path> get_exe_path(const CommandLineOptions& options)
+{
+    namespace fs = std::filesystem;
+
+    const fs::path user_exe_dir{ options.exe_dir.value() };
+    const fs::path exe_path{
+        std::string_view{ options.exe_dir.value() }.ends_with(".exe")
+            ? user_exe_dir
+            : user_exe_dir / "Spel2.exe"
+    };
+
+    if (!fs::exists(exe_path))
+    {
+        return Error{
+            fmt::format("Path '{}' does not exist...", exe_path.string()),
+            FAILED_GAME_EXE_DOES_NOT_EXIST,
+        };
+    }
+
+    if (!fs::is_regular_file(exe_path))
+    {
+        return Error{
+            fmt::format("Path '{}' is not a file...", exe_path.string()),
+            FAILED_GAME_EXE_IS_NOT_A_FILE,
+        };
+    }
+
+    return exe_path;
+}
+
 int main(int argc, char* argv[])
 {
     try
@@ -140,24 +159,8 @@ int main(int argc, char* argv[])
         }
 
         namespace fs = std::filesystem;
-        const fs::path user_exe_dir{ options.exe_dir.value() };
-        const fs::path exe_path{
-            std::string_view{ options.exe_dir.value() }.ends_with(".exe")
-                ? user_exe_dir
-                : user_exe_dir / "Spel2.exe"
-        };
 
-        if (!fs::exists(exe_path))
-        {
-            fmt::print("Path '{}' does not exist...", exe_path.string());
-            return FAILED_GAME_EXE_DOES_NOT_EXIST;
-        }
-
-        if (!fs::is_regular_file(exe_path))
-        {
-            fmt::print("Path '{}' is not a file...", exe_path.string());
-            return FAILED_GAME_EXE_IS_NOT_A_FILE;
-        }
+        const fs::path exe_path = as_value(get_exe_path(options));
 
         std::vector<std::byte> exe_data{ ReadWholeFile(exe_path) };
 
@@ -562,11 +565,21 @@ int main(int argc, char* argv[])
 
         (void)image_dos_header;
     }
-    catch (structopt::exception& e)
+    catch (const RipException& e)
     {
-        fmt::print("{}\n", e.what());
+        fmt::print(fmt::fg(fmt::color::red), "Error: {}\n", e.what());
+        return e.why();
+    }
+    catch (const structopt::exception& e)
+    {
+        fmt::print(fmt::fg(fmt::color::red), "Error: {}\n", e.what());
         fmt::print("{}\n", e.help());
         return FAILED_PARSING_COMMAND_LINE;
+    }
+    catch (const std::exception& e)
+    {
+        fmt::print(fmt::fg(fmt::color::red), "Error: {}\n", e.what());
+        return FAILED_UNCAUGHT_EXCEPTION;
     }
 
     return SUCCESS;

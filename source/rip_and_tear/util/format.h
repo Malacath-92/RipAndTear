@@ -4,4 +4,5 @@
 #pragma warning(disable : 4459)
 #define FMT_HEADER_ONLY
 #include <fmt/format.h>
+#include <fmt/color.h>
 #pragma warning(pop)
