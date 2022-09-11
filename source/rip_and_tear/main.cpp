@@ -687,6 +687,11 @@ void patch_absolute_addresses(Logger logger,
 
                 break;
             }
+            case DataDirectoryEntry::IAT:
+            {
+                logger.verbose("IAT entry already handled during import table handling...");
+                break;
+            }
             case DataDirectoryEntry::SECURITY:
                 [[fallthrough]];
             case DataDirectoryEntry::ARCHITECTURE:
@@ -694,8 +699,6 @@ void patch_absolute_addresses(Logger logger,
             case DataDirectoryEntry::GLOBALPTR:
                 [[fallthrough]];
             case DataDirectoryEntry::BOUND_IMPORT:
-                [[fallthrough]];
-            case DataDirectoryEntry::IAT:
                 [[fallthrough]];
             case DataDirectoryEntry::DELAY_IMPORT:
                 [[fallthrough]];
