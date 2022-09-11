@@ -87,6 +87,37 @@ template<class T, class U>
 {
     return *get_ptr_and_advance<T>(data, 1);
 };
+template<class T, class U>
+[[nodiscard]] std::span<T> get_nullterminated_table(U* const data)
+{
+    const size_t table_size = [&]()
+    {
+        static constexpr T zero_object{};
+        static constexpr size_t no_idx{ 0xffffffffffffffff };
+        T* table_memory{ get_ptr<T>(data) };
+        for (size_t i = 0; i < no_idx; i++)
+        {
+            if (memcmp(table_memory + i, &zero_object, sizeof(T)) == 0)
+            {
+                return i;
+            }
+        }
+
+        return no_idx;
+    }();
+    std::span<T> table{
+        get_ptr<T>(data),
+        table_size,
+    };
+    return table;
+}
+template<class T, class U>
+[[nodiscard]] std::span<T> get_nullterminated_table_and_advance(U*& data)
+{
+    std::span<T> table{ get_nullterminated_table<T>(data) };
+    data += sizeof(T) * (table.size() + 1);
+    return table;
+}
 
 size_t get_data_bunde_size(const void* bundle_start)
 {
@@ -492,6 +523,7 @@ void patch_absolute_addresses(Logger logger,
                                                             std::byte* executable)
 {
     logger.verbose("Patch data directory...");
+    auto data_directory_popper{ logger.push_segment() };
 
     for (const auto& [idx, data_directory] : algo::enumerate(image_optional_header.DataDirectory))
     {
@@ -544,9 +576,13 @@ void patch_absolute_addresses(Logger logger,
             {
             case DataDirectoryEntry::EXPORT:
             {
+                logger.verbose("Patching export table...");
+                auto export_table_popper{ logger.push_segment() };
+
                 IMAGE_EXPORT_DIRECTORY& export_table{ get_ref<IMAGE_EXPORT_DIRECTORY>(executable + address_of_raw_data) };
                 export_table.Name = static_cast<DWORD>(export_table.Name - relocation_offset);
-                auto offset_pointer_table = [&](size_t rva, size_t size) {
+                auto offset_pointer_table = [&](size_t rva, size_t size)
+                {
                     std::span<DWORD> table{
                         get_ptr<DWORD>(executable + rva + virtual_raw_offset),
                         size,
@@ -558,14 +594,85 @@ void patch_absolute_addresses(Logger logger,
                             table_entry = static_cast<DWORD>(table_entry - relocation_offset);
                         }
                     }
+                    return table;
                 };
-                offset_pointer_table(export_table.AddressOfFunctions, export_table.NumberOfFunctions);
-                offset_pointer_table(export_table.AddressOfNames, export_table.NumberOfNames);
+
+                if (logger.is_verbose)
+                {
+                    offset_pointer_table(export_table.AddressOfFunctions, export_table.NumberOfFunctions);
+                    const std::span<DWORD> names{ offset_pointer_table(export_table.AddressOfNames, export_table.NumberOfNames) };
+                    for (const DWORD name_rva : names)
+                    {
+                        const char* name{ reinterpret_cast<const char*>(executable + name_rva + virtual_raw_offset) };
+                        logger.verbose("Relocating exported function '{}'...", name);
+                    }
+                }
 
                 break;
             }
             case DataDirectoryEntry::IMPORT:
-                [[fallthrough]];
+            {
+                logger.verbose("Patching import table...");
+                auto import_table_popper{ logger.push_segment() };
+
+                std::span<IMAGE_IMPORT_DESCRIPTOR> import_desc_table{
+                    get_nullterminated_table<IMAGE_IMPORT_DESCRIPTOR>(executable + address_of_raw_data)
+                };
+
+                for (IMAGE_IMPORT_DESCRIPTOR& import_desc : import_desc_table)
+                {
+                    import_desc.OriginalFirstThunk = static_cast<DWORD>(import_desc.OriginalFirstThunk - relocation_offset);
+                    import_desc.Name = static_cast<DWORD>(import_desc.Name - relocation_offset);
+                    import_desc.FirstThunk = static_cast<DWORD>(import_desc.FirstThunk - relocation_offset);
+
+                    const char* module_name{ reinterpret_cast<const char*>(executable + import_desc.Name + virtual_raw_offset) };
+                    logger.verbose("Relocating imported module '{}'...", module_name);
+                    auto import_module_popper{ logger.push_segment() };
+
+                    const ptrdiff_t original_thunk_table_address{ import_desc.OriginalFirstThunk + virtual_raw_offset };
+                    std::span<IMAGE_THUNK_DATA> original_thunk_table{
+                        get_nullterminated_table<IMAGE_THUNK_DATA>(executable + original_thunk_table_address)
+                    };
+                    for (IMAGE_THUNK_DATA& original_thunk : original_thunk_table)
+                    {
+                        using THUNK_T = decltype(decltype(IMAGE_THUNK_DATA::u1)::AddressOfData);
+                        constexpr THUNK_T ordinal_bit{ THUNK_T(1) << (sizeof(THUNK_T) * 8 - 1) };
+                        const bool is_ordinal{ (original_thunk.u1.AddressOfData & ordinal_bit) != 0 };
+                        if (is_ordinal)
+                        {
+                            const size_t ordinal{ original_thunk.u1.Ordinal & ~ordinal_bit };
+                            logger.verbose("No need to relocate imported function '{}::Ordinal.{}'...", module_name, ordinal);
+                        }
+                        else
+                        {
+                            original_thunk.u1.AddressOfData = static_cast<DWORD>(original_thunk.u1.AddressOfData - relocation_offset);
+                            IMAGE_IMPORT_BY_NAME* function_import_desc{
+                                reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(executable + original_thunk.u1.AddressOfData + virtual_raw_offset)
+                            };
+                            logger.verbose("Relocating imported function '{}::{}'...", module_name, function_import_desc->Name);
+                        }
+                    }
+
+                    const ptrdiff_t thunk_table_address{ import_desc.FirstThunk + virtual_raw_offset };
+                    std::span<size_t> thunk_table{
+                        get_nullterminated_table<size_t>(executable + thunk_table_address)
+                    };
+                    for (size_t& thunk : thunk_table)
+                    {
+                        thunk = thunk - relocation_offset;
+                    }
+
+                    if (import_desc.ForwarderChain != 0)
+                    {
+                        return Error{
+                            "Import forwarder chain is not supported...",
+                            FAILED_UNSUPPORTED_IMPORT_FORWARDER_CHAIN,
+                        };
+                    }
+                }
+
+                break;
+            }
             case DataDirectoryEntry::RESOURCE:
                 [[fallthrough]];
             case DataDirectoryEntry::EXCEPTION:
