@@ -60,7 +60,7 @@ struct Logger
     void error(const char* fmt, Args&&... args)
     {
         fmt::print(fmt::fg(fmt::color::red), "{:\t>{}}", "Error: ", segment_depth);
-        fmt::print(fmt::fg(fmt::color::yellow), fmt, std::forward<Args>(args)...);
+        fmt::print(fmt::fg(fmt::color::red), fmt, std::forward<Args>(args)...);
         fmt::print("\n");
     }
 };
