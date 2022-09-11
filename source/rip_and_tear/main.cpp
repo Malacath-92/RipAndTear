@@ -19,7 +19,7 @@
 struct CommandLineOptions
 {
     std::optional<std::string> exe_dir;
-    std::optional<std::string> output_name{ "Tear2.exe" };
+    std::optional<std::string> output_name{ "Mick2.exe" };
     std::optional<bool> insert_debug_interrupts{ false };
     std::optional<bool> debug_do_not_relocated{ false };
     std::optional<int32_t> exit_reason;
