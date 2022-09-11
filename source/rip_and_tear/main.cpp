@@ -679,7 +679,41 @@ void patch_absolute_addresses(Logger logger,
                 break;
             }
             case DataDirectoryEntry::EXCEPTION:
-                [[fallthrough]];
+            {
+                logger.verbose("Patching runtime function entries...");
+
+                std::span<IMAGE_RUNTIME_FUNCTION_ENTRY> image_runtime_function_array{
+                    get_nullterminated_table<IMAGE_RUNTIME_FUNCTION_ENTRY>(entry_start),
+                };
+                for (IMAGE_RUNTIME_FUNCTION_ENTRY& image_runtime_function_entry : image_runtime_function_array)
+                {
+                    if (image_runtime_function_entry.BeginAddress == 0)
+                    {
+                        break;
+                    }
+
+                    image_runtime_function_entry.BeginAddress = static_cast<DWORD>(image_runtime_function_entry.BeginAddress - relocation_offset);
+                    image_runtime_function_entry.EndAddress = static_cast<DWORD>(image_runtime_function_entry.EndAddress - relocation_offset);
+                    image_runtime_function_entry.UnwindInfoAddress = static_cast<DWORD>(image_runtime_function_entry.UnwindInfoAddress - relocation_offset);
+
+                    const size_t unwind_info_offset{ image_runtime_function_entry.UnwindInfoAddress };
+                    std::byte* const unwind_info_data = executable + unwind_info_offset;
+                    UNWIND_INFO& unwind_info{ get_ref<UNWIND_INFO>(unwind_info_data) };
+                    if (unwind_info.Flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER))
+                    {
+                        ULONG& except_handler_offset = *(PULONG)GetLanguageSpecificDataPtr(&unwind_info);
+                        except_handler_offset = static_cast<ULONG>(except_handler_offset - relocation_offset);
+                    }
+                    else if (unwind_info.Flags & UNW_FLAG_CHAININFO)
+                    {
+                        ULONG& chain_info_offset = *(PULONG)GetLanguageSpecificDataPtr(&unwind_info);
+                        chain_info_offset = static_cast<ULONG>(chain_info_offset - relocation_offset);
+                    }
+                }
+
+                // TODO: More to do here?
+                break;
+            }
             case DataDirectoryEntry::SECURITY:
                 [[fallthrough]];
             case DataDirectoryEntry::BASERELOC:
