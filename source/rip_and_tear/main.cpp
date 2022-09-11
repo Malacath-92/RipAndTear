@@ -406,53 +406,6 @@ void patch_relative_addresses(Logger logger,
         }
         else if ((const char*)header.Name == ".rsrc"sv)
         {
-            logger.verbose("Patching resource directory...");
-            auto res_section_popper = logger.push_segment();
-
-            std::byte* const section_start{ section_data };
-            auto patch_directory_recursive = [&](std::byte* directory_data, auto& self) -> void
-            {
-                IMAGE_RESOURCE_DIRECTORY& resource_directory = get_ref_and_advance<IMAGE_RESOURCE_DIRECTORY>(directory_data);
-                for (size_t i = 0; i < resource_directory.NumberOfNamedEntries + resource_directory.NumberOfIdEntries; i++)
-                {
-                    IMAGE_RESOURCE_DIRECTORY_ENTRY& resource_entry = get_ref_and_advance<IMAGE_RESOURCE_DIRECTORY_ENTRY>(directory_data);
-
-                    const bool named{ i < resource_directory.NumberOfNamedEntries };
-                    if (named)
-                    {
-                        if (resource_entry.NameIsString)
-                        {
-                            std::byte* const name_address{ section_start + resource_entry.NameOffset };
-                            IMAGE_RESOURCE_DIR_STRING_U& name{ get_ref<IMAGE_RESOURCE_DIR_STRING_U>(name_address) };
-                            const std::string name_utf8{ algo::to_utf8(std::wstring{ name.NameString, name.Length }) };
-                            logger.verbose("Named: {}", name_utf8);
-                        }
-                        else
-                        {
-                            logger.verbose("Named: {}", (DWORD)resource_entry.NameOffset);
-                        }
-                    }
-                    else
-                    {
-                        logger.verbose("Id: {}", resource_entry.Id);
-                    }
-
-                    if (resource_entry.DataIsDirectory)
-                    {
-                        auto dir_popper = logger.push_segment();
-                        self(section_start + resource_entry.OffsetToDirectory, self);
-                    }
-                    else
-                    {
-                        std::byte* const data_address{ section_start + resource_entry.OffsetToData };
-                        IMAGE_RESOURCE_DATA_ENTRY& data_entry{ get_ref<IMAGE_RESOURCE_DATA_ENTRY>(data_address) };
-                        data_entry.OffsetToData = static_cast<DWORD>(data_entry.OffsetToData - relocation_offset);
-                    }
-                }
-            };
-            logger.verbose("Root");
-            auto root_popper = logger.push_segment();
-            patch_directory_recursive(section_data, patch_directory_recursive);
         }
         else if ((const char*)header.Name == ".reloc"sv)
         {
@@ -551,6 +504,7 @@ void patch_absolute_addresses(Logger logger,
 
             const ptrdiff_t virtual_raw_offset{ static_cast<ptrdiff_t>(containing_section->PointerToRawData) - containing_section->VirtualAddress };
             const ptrdiff_t address_of_raw_data{ data_directory.VirtualAddress + virtual_raw_offset };
+            std::byte* const entry_start{ executable + address_of_raw_data };
 
             enum class DataDirectoryEntry
             {
@@ -579,7 +533,7 @@ void patch_absolute_addresses(Logger logger,
                 logger.verbose("Patching export table...");
                 auto export_table_popper{ logger.push_segment() };
 
-                IMAGE_EXPORT_DIRECTORY& export_table{ get_ref<IMAGE_EXPORT_DIRECTORY>(executable + address_of_raw_data) };
+                IMAGE_EXPORT_DIRECTORY& export_table{ get_ref<IMAGE_EXPORT_DIRECTORY>(entry_start) };
                 export_table.Name = static_cast<DWORD>(export_table.Name - relocation_offset);
                 auto offset_pointer_table = [&](size_t rva, size_t size)
                 {
@@ -616,7 +570,7 @@ void patch_absolute_addresses(Logger logger,
                 auto import_table_popper{ logger.push_segment() };
 
                 std::span<IMAGE_IMPORT_DESCRIPTOR> import_desc_table{
-                    get_nullterminated_table<IMAGE_IMPORT_DESCRIPTOR>(executable + address_of_raw_data)
+                    get_nullterminated_table<IMAGE_IMPORT_DESCRIPTOR>(entry_start)
                 };
 
                 for (IMAGE_IMPORT_DESCRIPTOR& import_desc : import_desc_table)
@@ -674,7 +628,56 @@ void patch_absolute_addresses(Logger logger,
                 break;
             }
             case DataDirectoryEntry::RESOURCE:
-                [[fallthrough]];
+            {
+                logger.verbose("Patching resource directory...");
+                auto res_section_popper = logger.push_segment();
+
+                auto patch_directory_recursive = [&](std::byte* directory_data, auto& self) -> void
+                {
+                    IMAGE_RESOURCE_DIRECTORY& resource_directory = get_ref_and_advance<IMAGE_RESOURCE_DIRECTORY>(directory_data);
+                    for (size_t i = 0; i < resource_directory.NumberOfNamedEntries + resource_directory.NumberOfIdEntries; i++)
+                    {
+                        IMAGE_RESOURCE_DIRECTORY_ENTRY& resource_entry = get_ref_and_advance<IMAGE_RESOURCE_DIRECTORY_ENTRY>(directory_data);
+
+                        const bool named{ i < resource_directory.NumberOfNamedEntries };
+                        if (named)
+                        {
+                            if (resource_entry.NameIsString)
+                            {
+                                std::byte* const name_address{ entry_start + resource_entry.NameOffset };
+                                IMAGE_RESOURCE_DIR_STRING_U& name{ get_ref<IMAGE_RESOURCE_DIR_STRING_U>(name_address) };
+                                const std::string name_utf8{ algo::to_utf8(std::wstring{ name.NameString, name.Length }) };
+                                logger.verbose("Named: {}", name_utf8);
+                            }
+                            else
+                            {
+                                logger.verbose("Named: {}", (DWORD)resource_entry.NameOffset);
+                            }
+                        }
+                        else
+                        {
+                            logger.verbose("Id: {}", resource_entry.Id);
+                        }
+
+                        if (resource_entry.DataIsDirectory)
+                        {
+                            auto dir_popper = logger.push_segment();
+                            self(entry_start + resource_entry.OffsetToDirectory, self);
+                        }
+                        else
+                        {
+                            std::byte* const data_address{ entry_start + resource_entry.OffsetToData };
+                            IMAGE_RESOURCE_DATA_ENTRY& data_entry{ get_ref<IMAGE_RESOURCE_DATA_ENTRY>(data_address) };
+                            data_entry.OffsetToData = static_cast<DWORD>(data_entry.OffsetToData - relocation_offset);
+                        }
+                    }
+                };
+                logger.verbose("Root");
+                auto root_popper = logger.push_segment();
+                patch_directory_recursive(entry_start, patch_directory_recursive);
+
+                break;
+            }
             case DataDirectoryEntry::EXCEPTION:
                 [[fallthrough]];
             case DataDirectoryEntry::SECURITY:
