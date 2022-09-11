@@ -654,9 +654,12 @@ void patch_absolute_addresses(Logger logger,
 
                 break;
             }
-            case DataDirectoryEntry::SECURITY:
-                [[fallthrough]];
             case DataDirectoryEntry::DEBUG:
+            {
+                logger.verbose("No work to be done on debug entry...");
+                break;
+            }
+            case DataDirectoryEntry::SECURITY:
                 [[fallthrough]];
             case DataDirectoryEntry::ARCHITECTURE:
                 [[fallthrough]];
