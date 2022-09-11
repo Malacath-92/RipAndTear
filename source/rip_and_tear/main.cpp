@@ -453,6 +453,9 @@ void patch_absolute_addresses(Logger logger,
 
                 IMAGE_EXPORT_DIRECTORY& export_table{ get_ref<IMAGE_EXPORT_DIRECTORY>(entry_start) };
                 export_table.Name = static_cast<DWORD>(export_table.Name - relocation_offset);
+                export_table.AddressOfFunctions = static_cast<DWORD>(export_table.AddressOfFunctions - relocation_offset);
+                export_table.AddressOfNames = static_cast<DWORD>(export_table.AddressOfNames - relocation_offset);
+
                 auto offset_pointer_table = [&](size_t rva, size_t size)
                 {
                     std::span<DWORD> table{
