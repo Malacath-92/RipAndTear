@@ -650,6 +650,7 @@ void patch_absolute_addresses(Logger logger,
 }
 
 [[nodiscard]] expected<std::monostate> patch_bundle_init(Logger& logger,
+                                                         std::span<IMAGE_SECTION_HEADER> image_section_headers,
                                                          std::span<std::byte> executable,
                                                          bool debug_int)
 {
@@ -669,20 +670,74 @@ void patch_absolute_addresses(Logger logger,
             // Skip the call
             function_end += 5;
 
+            const IMAGE_SECTION_HEADER* text_section_header = algo::find(
+                image_section_headers,
+                &IMAGE_SECTION_HEADER::Name,
+                std::basic_string_view<BYTE>{ (unsigned char*)".text" });
+            const ptrdiff_t virtual_raw_offset{
+                static_cast<ptrdiff_t>(text_section_header->VirtualAddress) - text_section_header->PointerToRawData
+            };
+
+            // Find MOV dword ptr [g_DataBundleSize], RAX
+            std::byte* mov_data_bundle_size_addr{ find_pattern(std::span{ function_begin, 0x1000 }, "\x48\x89\x05"sv) };
+            // Intermediary
+            std::byte* const intermediary_addr{ find_pattern(std::span{ mov_data_bundle_size_addr + 1, 0x1000 }, "\x48\x89\x05"sv) };
+            // Find MOV qword ptr [g_DataBundlePtr], RAX
+            std::byte* const mov_data_bundle_ptr_addr{ find_pattern(std::span{ intermediary_addr + 1, 0x1000 }, "\x48\x89\x05"sv) };
+
+            // Get instruction-relative offsets
+            const uint32_t data_bundle_size_rel_offset{ *reinterpret_cast<uint32_t*>(mov_data_bundle_size_addr + 3) };
+            const uint32_t data_bundle_ptr_rel_offset{ *reinterpret_cast<uint32_t*>(mov_data_bundle_ptr_addr + 3) };
+
+            // Convert to RVAs
+            const ptrdiff_t data_bundle_size_rva{
+                (mov_data_bundle_size_addr + virtual_raw_offset + 7 + data_bundle_size_rel_offset) - executable.data()
+            };
+            const ptrdiff_t data_bundle_ptr_rva{
+                (mov_data_bundle_ptr_addr + virtual_raw_offset + 7 + data_bundle_ptr_rel_offset) - executable.data()
+            };
+
+            // Data bundle always at beginning of .text section
+            const ptrdiff_t data_bundle_rva{ text_section_header->VirtualAddress };
+
+            // TODO: Do we need to set DAT_162dd97b8, DAT_162dd97a0?
+
             constexpr std::string_view new_code{
-                "\x48\xc7\x05\xe1\xda\x14\x00\x00\x00\x00\x00" // MOV qword ptr [g_DataBundleSize], 0x0
-                "\x48\xc7\x05\xe6\xda\x14\x00\x00\x00\x00\x00" // MOV dword ptr [DAT_162dd97b8], 0x0
-                "\x48\x8d\x05\x27\x53\x37\xdd"                 // LEA RAX, [g_DataBundle]
-                "\x48\x89\x05\xd0\xda\x14\x00"                 // MOV qword ptr [g_DataBundlePtr], RAX
+                "\x48\xc7\x05\xff\xff\xff\xff\x00\x00\x00\x00" // MOV qword ptr [g_DataBundleSize], 0x0
+                "\x48\x8d\x05\xff\xff\xff\xff"                 // LEA RAX, [g_DataBundle]
+                "\x48\x89\x05\xff\xff\xff\xff"                 // MOV qword ptr [g_DataBundlePtr], RAX
+                "\xc3"                                         // RET
                 ""sv
             };
             std::memset(function_begin, '\x90', function_end - function_begin);
             std::memcpy(function_begin, new_code.data(), new_code.size());
 
+            // Get addresses of new instructions
+            std::byte* new_mov_data_bundle_size_addr{ function_begin };
+            std::byte* new_lea_data_bundle_addr{ new_mov_data_bundle_size_addr + 11 };
+            std::byte* new_mov_data_bundle_ptr_addr{ new_lea_data_bundle_addr + 7 };
+
+            // Translate RVAs back into instruction-relative offsets
+            const uint32_t mew_data_bundle_size_rel_offset{
+                static_cast<uint32_t>(executable.data() + data_bundle_size_rva - (new_mov_data_bundle_size_addr + virtual_raw_offset + 11))
+            };
+            const uint32_t mew_data_bundle_rel_offset{
+                static_cast<uint32_t>(executable.data() + data_bundle_rva - (new_lea_data_bundle_addr + virtual_raw_offset + 7))
+            };
+            const uint32_t mew_data_bundle_ptr_rel_offset{
+                static_cast<uint32_t>(executable.data() + data_bundle_ptr_rva - (new_mov_data_bundle_ptr_addr + virtual_raw_offset + 7))
+            };
+
+            // Write the offsets to memory
+            *reinterpret_cast<uint32_t*>(new_mov_data_bundle_size_addr + 3) = mew_data_bundle_size_rel_offset;
+            *reinterpret_cast<uint32_t*>(new_lea_data_bundle_addr + 3) = mew_data_bundle_rel_offset;
+            *reinterpret_cast<uint32_t*>(new_mov_data_bundle_ptr_addr + 3) = mew_data_bundle_ptr_rel_offset;
+
             if (debug_int)
             {
                 logger.verbose("Writing 'int3' instruction at the beginning of patched code in main...");
-                *(function_end - 1) = std::byte{ 0xcc };
+                function_begin[new_code.size() - 1] = std::byte{ 0xcc };
+                function_begin[new_code.size()] = std::byte{ 0xc3 };
             }
 
             return std::monostate{};
@@ -839,6 +894,7 @@ int main(int argc, char* argv[])
                                   options.insert_debug_interrupts.value_or(false)));
 
         (void)as_value(patch_bundle_init(logger,
+                                         headers.image_section_headers,
                                          exe_data,
                                          options.insert_debug_interrupts.value_or(false)));
 
