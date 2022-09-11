@@ -671,13 +671,24 @@ void patch_absolute_addresses(Logger logger,
 
                 break;
             }
+            case DataDirectoryEntry::LOAD_CONFIG:
+            {
+                logger.verbose("Patching load config table...");
+
+                IMAGE_LOAD_CONFIG_DIRECTORY& load_config_directory{ get_ref<IMAGE_LOAD_CONFIG_DIRECTORY>(entry_start) };
+                load_config_directory.SecurityCookie = load_config_directory.SecurityCookie - relocation_offset;
+                load_config_directory.GuardCFCheckFunctionPointer = load_config_directory.GuardCFCheckFunctionPointer - relocation_offset;
+                load_config_directory.GuardCFDispatchFunctionPointer = load_config_directory.GuardCFDispatchFunctionPointer - relocation_offset;
+
+                // TODO: More to do here? Set the IMAGE_GUARD_SECURITY_COOKIE_UNUSED flag?
+
+                break;
+            }
             case DataDirectoryEntry::SECURITY:
                 [[fallthrough]];
             case DataDirectoryEntry::ARCHITECTURE:
                 [[fallthrough]];
             case DataDirectoryEntry::GLOBALPTR:
-                [[fallthrough]];
-            case DataDirectoryEntry::LOAD_CONFIG:
                 [[fallthrough]];
             case DataDirectoryEntry::BOUND_IMPORT:
                 [[fallthrough]];
