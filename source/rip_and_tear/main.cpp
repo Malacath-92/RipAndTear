@@ -659,13 +659,23 @@ void patch_absolute_addresses(Logger logger,
                 logger.verbose("No work to be done on debug entry...");
                 break;
             }
+            case DataDirectoryEntry::TLS:
+            {
+                logger.verbose("Patching tls table...");
+
+                IMAGE_TLS_DIRECTORY& tls_directory{ get_ref<IMAGE_TLS_DIRECTORY>(entry_start) };
+                tls_directory.StartAddressOfRawData = tls_directory.StartAddressOfRawData - relocation_offset;
+                tls_directory.EndAddressOfRawData = tls_directory.EndAddressOfRawData - relocation_offset;
+                tls_directory.AddressOfIndex = tls_directory.AddressOfIndex - relocation_offset;
+                tls_directory.AddressOfCallBacks = tls_directory.AddressOfCallBacks - relocation_offset;
+
+                break;
+            }
             case DataDirectoryEntry::SECURITY:
                 [[fallthrough]];
             case DataDirectoryEntry::ARCHITECTURE:
                 [[fallthrough]];
             case DataDirectoryEntry::GLOBALPTR:
-                [[fallthrough]];
-            case DataDirectoryEntry::TLS:
                 [[fallthrough]];
             case DataDirectoryEntry::LOAD_CONFIG:
                 [[fallthrough]];
