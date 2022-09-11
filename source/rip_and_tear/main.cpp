@@ -21,10 +21,11 @@ struct CommandLineOptions
     std::optional<std::string> exe_dir;
     std::optional<std::string> output_name{ "Tear2.exe" };
     std::optional<bool> insert_debug_interrupts{ false };
+    std::optional<bool> debug_do_not_relocated{ false };
     std::optional<int32_t> exit_reason;
     std::optional<bool> verbose{ false };
 };
-VISITABLE_STRUCT(CommandLineOptions, exe_dir, output_name, insert_debug_interrupts, exit_reason, verbose);
+VISITABLE_STRUCT(CommandLineOptions, exe_dir, output_name, insert_debug_interrupts, debug_do_not_relocated, exit_reason, verbose);
 
 struct Logger
 {
@@ -213,7 +214,8 @@ struct BundleExtractionResult
 expected<BundleExtractionResult> extract_bundle(Logger logger,
                                                 IMAGE_OPTIONAL_HEADER& image_optional_header,
                                                 std::span<IMAGE_SECTION_HEADER> image_section_headers,
-                                                std::byte* executable)
+                                                std::byte* executable,
+                                                bool debug_do_not_relocated)
 {
     using namespace std::string_view_literals;
 
@@ -238,8 +240,15 @@ expected<BundleExtractionResult> extract_bundle(Logger logger,
             std::byte* const bundle_data_start{ executable + bundle_data_offset };
             const size_t bundle_size{ get_data_bunde_size(bundle_data_start) };
 
-            // Align to the value specified in the header
-            relocation_offset = bundle_size & ~(static_cast<size_t>(image_optional_header.FileAlignment) - 1);
+            if (debug_do_not_relocated)
+            {
+                relocation_offset = 0;
+            }
+            else
+            {
+                // Align to the value specified in the header
+                relocation_offset = bundle_size & ~(static_cast<size_t>(image_optional_header.FileAlignment) - 1);
+            }
 
             logger.verbose("Found data bundle of size {:#x}...", bundle_size);
             logger.verbose("Aligning to {:#x} bytes, resulting in {:#x}...", image_optional_header.FileAlignment, relocation_offset);
@@ -805,7 +814,8 @@ int main(int argc, char* argv[])
             as_value(extract_bundle(logger,
                                     headers.image_optional_header,
                                     headers.image_section_headers,
-                                    exe_data.data()))
+                                    exe_data.data(),
+                                    options.debug_do_not_relocated.value_or(false)))
         };
 
         patch_relative_addresses(logger,
