@@ -755,7 +755,7 @@ void patch_absolute_addresses(Logger logger,
                                                     [[maybe_unused]] std::span<std::byte> executable,
                                                     [[maybe_unused]] size_t relocation_offset)
 {
-#ifndef DEBUG
+#ifndef NDEBUG
     logger.verbose("Verifying that all data was moved...");
     auto debug_popper = logger.push_segment();
 
@@ -782,7 +782,7 @@ void patch_absolute_addresses(Logger logger,
         return false;
     };
 
-    if (!memzcmp(last_section_end, leftover_size))
+    if (leftover_size > 0 && !memzcmp(last_section_end, leftover_size))
     {
         logger.warning("Not all data past the relocated executable is nulled out...");
     }
