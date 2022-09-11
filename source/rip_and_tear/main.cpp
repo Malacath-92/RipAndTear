@@ -475,6 +475,105 @@ void patch_absolute_addresses(Logger logger,
     }
 }
 
+[[nodiscard]] expected<std::monostate> patch_data_directory(Logger& logger,
+                                                            IMAGE_OPTIONAL_HEADER& image_optional_header,
+                                                            std::span<IMAGE_SECTION_HEADER> image_section_headers,
+                                                            size_t text_section_start,
+                                                            size_t relocation_offset)
+{
+    logger.verbose("Patch data directory...");
+
+    for (const auto& [idx, data_directory] : algo::enumerate(image_optional_header.DataDirectory))
+    {
+        if (data_directory.VirtualAddress > text_section_start)
+        {
+            data_directory.VirtualAddress = static_cast<DWORD>(data_directory.VirtualAddress - relocation_offset);
+
+            const IMAGE_SECTION_HEADER* containing_section = algo::find_if(
+                image_section_headers,
+                [&](const IMAGE_SECTION_HEADER& image_section_headers)
+                {
+                    // clang-format off
+                    return image_section_headers.VirtualAddress <= data_directory.VirtualAddress
+                        && image_section_headers.VirtualAddress + image_section_headers.Misc.VirtualSize > data_directory.VirtualAddress;
+                    // clang-format on
+                });
+
+            if (containing_section == nullptr)
+            {
+                return Error{
+                    "Data directory is not contained within a section...",
+                    FAILED_MYSTERY_DATA_DIRECTORY,
+                };
+            }
+
+            const ptrdiff_t virtual_raw_offset{ static_cast<ptrdiff_t>(containing_section->PointerToRawData) - containing_section->VirtualAddress };
+            const size_t address_of_raw_data{ static_cast<size_t>(data_directory.VirtualAddress + virtual_raw_offset) };
+
+            enum class DataDirectoryEntry
+            {
+                EXPORT = IMAGE_DIRECTORY_ENTRY_EXPORT,
+                IMPORT = IMAGE_DIRECTORY_ENTRY_IMPORT,
+                RESOURCE = IMAGE_DIRECTORY_ENTRY_RESOURCE,
+                EXCEPTION = IMAGE_DIRECTORY_ENTRY_EXCEPTION,
+                SECURITY = IMAGE_DIRECTORY_ENTRY_SECURITY,
+                BASERELOC = IMAGE_DIRECTORY_ENTRY_BASERELOC,
+                DEBUG = IMAGE_DIRECTORY_ENTRY_DEBUG,
+                ARCHITECTURE = IMAGE_DIRECTORY_ENTRY_ARCHITECTURE,
+                GLOBALPTR = IMAGE_DIRECTORY_ENTRY_GLOBALPTR,
+                TLS = IMAGE_DIRECTORY_ENTRY_TLS,
+                LOAD_CONFIG = IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG,
+                BOUND_IMPORT = IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT,
+                IAT = IMAGE_DIRECTORY_ENTRY_IAT,
+                DELAY_IMPORT = IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT,
+                COM_DESCRIPTOR = IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR,
+            };
+            DataDirectoryEntry data_directory_entry{ static_cast<DataDirectoryEntry>(idx) };
+
+            switch (data_directory_entry)
+            {
+            case DataDirectoryEntry::EXPORT:
+                [[fallthrough]];
+            case DataDirectoryEntry::IMPORT:
+                [[fallthrough]];
+            case DataDirectoryEntry::RESOURCE:
+                [[fallthrough]];
+            case DataDirectoryEntry::EXCEPTION:
+                [[fallthrough]];
+            case DataDirectoryEntry::SECURITY:
+                [[fallthrough]];
+            case DataDirectoryEntry::BASERELOC:
+                [[fallthrough]];
+            case DataDirectoryEntry::DEBUG:
+                [[fallthrough]];
+            case DataDirectoryEntry::ARCHITECTURE:
+                [[fallthrough]];
+            case DataDirectoryEntry::GLOBALPTR:
+                [[fallthrough]];
+            case DataDirectoryEntry::TLS:
+                [[fallthrough]];
+            case DataDirectoryEntry::LOAD_CONFIG:
+                [[fallthrough]];
+            case DataDirectoryEntry::BOUND_IMPORT:
+                [[fallthrough]];
+            case DataDirectoryEntry::IAT:
+                [[fallthrough]];
+            case DataDirectoryEntry::DELAY_IMPORT:
+                [[fallthrough]];
+            case DataDirectoryEntry::COM_DESCRIPTOR:
+                [[fallthrough]];
+            default:
+                return Error{
+                    fmt::format("Data Directory Entry '{}' is not supported...", magic_enum::enum_name(data_directory_entry)),
+                    FAILED_UNSUPPORTED_DATA_DIRECTORY_ENTRY,
+                };
+            }
+        }
+    }
+
+    return std::monostate{};
+}
+
 [[nodiscard]] expected<std::monostate> patch_main(Logger& logger,
                                                   std::span<std::byte> executable,
                                                   bool debug_int)
@@ -587,24 +686,6 @@ void patch_absolute_addresses(Logger logger,
     };
 }
 
-void patch_data_directories(Logger& logger,
-                            IMAGE_OPTIONAL_HEADER& image_optional_header,
-                            size_t text_section_start,
-                            size_t relocation_offset)
-{
-    logger.verbose("Patch data directories...");
-
-    for (IMAGE_DATA_DIRECTORY& data_directory : image_optional_header.DataDirectory)
-    {
-        if (data_directory.VirtualAddress > text_section_start)
-        {
-            data_directory.VirtualAddress = static_cast<DWORD>(data_directory.VirtualAddress - relocation_offset);
-        }
-
-        // TODO: handle each directory
-    }
-}
-
 [[nodiscard]] expected<std::monostate> debug_verify([[maybe_unused]] Logger& logger,
                                                     [[maybe_unused]] std::span<IMAGE_SECTION_HEADER> image_section_headers,
                                                     [[maybe_unused]] std::span<std::byte> executable,
@@ -699,7 +780,7 @@ int main(int argc, char* argv[])
             fmt::print("Exit Code: {}\n"
                 "   Reason: {}\n",
                 options.exit_reason.value(),
-                magic_enum::enum_name<ExitReason>(static_cast<ExitReason>(options.exit_reason.value())));
+                magic_enum::enum_name(static_cast<ExitReason>(options.exit_reason.value())));
             // clang-format on
             return SUCCESS;
         }
@@ -737,23 +818,24 @@ int main(int argc, char* argv[])
                                  bundle_extraction_result.relocation_offset,
                                  exe_data.data());
 
-        as_value(patch_main(logger,
-                            exe_data,
-                            options.insert_debug_interrupts.value_or(false)));
+        (void)as_value(patch_data_directory(logger,
+                                            headers.image_optional_header,
+                                            headers.image_section_headers,
+                                            bundle_extraction_result.text_section_start,
+                                            bundle_extraction_result.relocation_offset));
 
-        as_value(patch_bundle_init(logger,
-                                   exe_data,
-                                   options.insert_debug_interrupts.value_or(false)));
+        (void)as_value(patch_main(logger,
+                                  exe_data,
+                                  options.insert_debug_interrupts.value_or(false)));
 
-        patch_data_directories(logger,
-                               headers.image_optional_header,
-                               bundle_extraction_result.text_section_start,
-                               bundle_extraction_result.relocation_offset);
+        (void)as_value(patch_bundle_init(logger,
+                                         exe_data,
+                                         options.insert_debug_interrupts.value_or(false)));
 
-        as_value(debug_verify(logger,
-                              headers.image_section_headers,
-                              exe_data,
-                              bundle_extraction_result.relocation_offset));
+        (void)as_value(debug_verify(logger,
+                                    headers.image_section_headers,
+                                    exe_data,
+                                    bundle_extraction_result.relocation_offset));
 
         resize_executable(logger, headers.image_section_headers, exe_data);
 

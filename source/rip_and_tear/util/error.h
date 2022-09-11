@@ -15,6 +15,8 @@ enum ExitReason : int32_t
     FAILED_32BIT_EXE_NOT_SUPPORTED,
     FAILED_UNEXPECTED_TEXT_SECTION,
     FAILED_NO_TEXT_SECTION_FOUND,
+    FAILED_MYSTERY_DATA_DIRECTORY,
+    FAILED_UNSUPPORTED_DATA_DIRECTORY_ENTRY,
     FAILED_PATCHING_MAIN_FUNCTION,
     FAILED_PATCHING_BUNDLE_INIT_FUNCTION,
 };
@@ -49,7 +51,7 @@ class RipException
 template<class T>
 using expected = std::variant<Error, T>;
 template<class T>
-T& as_value(const expected<T>& e)
+[[nodiscard]] T& as_value(const expected<T>& e)
 {
     if (std::holds_alternative<T>(e))
     {
@@ -61,7 +63,7 @@ T& as_value(const expected<T>& e)
     }
 }
 template<class T>
-T as_value(expected<T>&& e)
+[[nodiscard]] T as_value(expected<T>&& e)
 {
     if (std::holds_alternative<T>(e))
     {

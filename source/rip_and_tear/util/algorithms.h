@@ -186,6 +186,30 @@ auto count_if(ContainerT&& container, FunT&& fun)
     return static_cast<std::size_t>(std::count_if(begin_it, end_it, std::forward<FunT>(fun)));
 }
 
+template<class T,
+         class TIter = decltype(std::begin(std::declval<T>())),
+         class = decltype(std::end(std::declval<T>()))>
+constexpr auto enumerate(T&& iterable)
+{
+    // clang-format off
+    struct iterator
+    {
+        size_t i;
+        TIter iter;
+        bool operator != (const iterator& other) const { return iter != other.iter; }
+        void operator ++ () { ++i; ++iter; }
+        auto operator * () const { return std::tie(i, *iter); }
+    };
+    struct iterable_wrapper
+    {
+        T iterable;
+        auto begin() { return iterator{ 0, std::begin(iterable) }; }
+        auto end() { return iterator{ 0, std::end(iterable) }; }
+    };
+    // clang-format on
+    return iterable_wrapper{ std::forward<T>(iterable) };
+}
+
 std::string path_string(const std::filesystem::path& path);
 bool is_same_path(const std::filesystem::path& lhs, const std::filesystem::path& rhs);
 bool is_sub_path(const std::filesystem::path& path, const std::filesystem::path& base);
