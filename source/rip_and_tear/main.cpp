@@ -351,88 +351,6 @@ expected<BundleExtractionResult> extract_bundle(Logger logger,
     };
 }
 
-void patch_relative_addresses(Logger logger,
-                              std::span<IMAGE_SECTION_HEADER> image_section_headers,
-                              size_t relocation_offset,
-                              std::byte* executable)
-{
-    using namespace std::string_view_literals;
-
-    logger.verbose("Patching relative virtual addresses in sections...");
-    auto patch_sections_popper = logger.push_segment();
-    for (IMAGE_SECTION_HEADER& header : image_section_headers)
-    {
-        logger.verbose("Patching {}...", (const char*)header.Name);
-        auto patch_section_popper = logger.push_segment();
-
-        const size_t section_offset{ header.PointerToRawData };
-        const size_t section_size{ header.SizeOfRawData };
-        std::byte* section_data = executable + section_offset;
-
-        if ((const char*)header.Name == ".pdata"sv)
-        {
-            logger.verbose("Patching runtime function entries...");
-
-            std::span<IMAGE_RUNTIME_FUNCTION_ENTRY> image_runtime_function_array{
-                span::bit_cast<IMAGE_RUNTIME_FUNCTION_ENTRY>(std::span<std::byte>{ section_data, section_size }),
-            };
-            for (IMAGE_RUNTIME_FUNCTION_ENTRY& image_runtime_function_entry : image_runtime_function_array)
-            {
-                if (image_runtime_function_entry.BeginAddress == 0)
-                {
-                    break;
-                }
-
-                image_runtime_function_entry.BeginAddress = static_cast<DWORD>(image_runtime_function_entry.BeginAddress - relocation_offset);
-                image_runtime_function_entry.EndAddress = static_cast<DWORD>(image_runtime_function_entry.EndAddress - relocation_offset);
-                image_runtime_function_entry.UnwindInfoAddress = static_cast<DWORD>(image_runtime_function_entry.UnwindInfoAddress - relocation_offset);
-
-                const size_t unwind_info_offset{ image_runtime_function_entry.UnwindInfoAddress };
-                std::byte* const unwind_info_data = executable + unwind_info_offset;
-                UNWIND_INFO& unwind_info{ get_ref<UNWIND_INFO>(unwind_info_data) };
-                if (unwind_info.Flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER))
-                {
-                    ULONG& except_handler_offset = *(PULONG)GetLanguageSpecificDataPtr(&unwind_info);
-                    except_handler_offset = static_cast<ULONG>(except_handler_offset - relocation_offset);
-                }
-                else if (unwind_info.Flags & UNW_FLAG_CHAININFO)
-                {
-                    ULONG& chain_info_offset = *(PULONG)GetLanguageSpecificDataPtr(&unwind_info);
-                    chain_info_offset = static_cast<ULONG>(chain_info_offset - relocation_offset);
-                }
-            }
-
-            // TODO: More to do here?
-        }
-        else if ((const char*)header.Name == ".rsrc"sv)
-        {
-        }
-        else if ((const char*)header.Name == ".reloc"sv)
-        {
-            logger.verbose("Patching relocation table...");
-
-            while (true)
-            {
-                DWORD& page_offset{ get_ref_and_advance<DWORD>(section_data) };
-                if (page_offset > 0)
-                {
-                    page_offset = static_cast<DWORD>(page_offset - relocation_offset);
-                    DWORD& reloc_block_size{ get_ref_and_advance<DWORD>(section_data) };
-                    section_data += reloc_block_size - sizeof(page_offset) - sizeof(reloc_block_size);
-                }
-                else
-                {
-                    break;
-                }
-            }
-        }
-        else
-        {
-            logger.verbose("No work to be done...");
-        }
-    }
-}
-
 void patch_absolute_addresses(Logger logger,
                               std::span<IMAGE_SECTION_HEADER> image_section_headers,
                               size_t relocation_offset,
@@ -714,9 +632,29 @@ void patch_absolute_addresses(Logger logger,
                 // TODO: More to do here?
                 break;
             }
-            case DataDirectoryEntry::SECURITY:
-                [[fallthrough]];
             case DataDirectoryEntry::BASERELOC:
+            {
+                logger.verbose("Patching relocation table...");
+
+                std::byte* reloc_table_data{ entry_start };
+                while (true)
+                {
+                    DWORD& page_offset{ get_ref_and_advance<DWORD>(reloc_table_data) };
+                    if (page_offset > 0)
+                    {
+                        page_offset = static_cast<DWORD>(page_offset - relocation_offset);
+                        DWORD& reloc_block_size{ get_ref_and_advance<DWORD>(reloc_table_data) };
+                        reloc_table_data += reloc_block_size - sizeof(page_offset) - sizeof(reloc_block_size);
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+
+                break;
+            }
+            case DataDirectoryEntry::SECURITY:
                 [[fallthrough]];
             case DataDirectoryEntry::DEBUG:
                 [[fallthrough]];
@@ -1037,11 +975,6 @@ int main(int argc, char* argv[])
                                     exe_data.data(),
                                     options.debug_do_not_relocated.value_or(false)))
         };
-
-        patch_relative_addresses(logger,
-                                 headers.image_section_headers,
-                                 bundle_extraction_result.relocation_offset,
-                                 exe_data.data());
 
         patch_absolute_addresses(logger,
                                  headers.image_section_headers,
