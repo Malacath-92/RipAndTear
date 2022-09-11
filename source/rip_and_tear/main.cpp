@@ -488,7 +488,8 @@ void patch_absolute_addresses(Logger logger,
                                                             IMAGE_OPTIONAL_HEADER& image_optional_header,
                                                             std::span<IMAGE_SECTION_HEADER> image_section_headers,
                                                             size_t text_section_start,
-                                                            size_t relocation_offset)
+                                                            size_t relocation_offset,
+                                                            std::byte* executable)
 {
     logger.verbose("Patch data directory...");
 
@@ -517,7 +518,7 @@ void patch_absolute_addresses(Logger logger,
             }
 
             const ptrdiff_t virtual_raw_offset{ static_cast<ptrdiff_t>(containing_section->PointerToRawData) - containing_section->VirtualAddress };
-            const size_t address_of_raw_data{ static_cast<size_t>(data_directory.VirtualAddress + virtual_raw_offset) };
+            const ptrdiff_t address_of_raw_data{ data_directory.VirtualAddress + virtual_raw_offset };
 
             enum class DataDirectoryEntry
             {
@@ -542,7 +543,27 @@ void patch_absolute_addresses(Logger logger,
             switch (data_directory_entry)
             {
             case DataDirectoryEntry::EXPORT:
-                [[fallthrough]];
+            {
+                IMAGE_EXPORT_DIRECTORY& export_table{ get_ref<IMAGE_EXPORT_DIRECTORY>(executable + address_of_raw_data) };
+                export_table.Name = static_cast<DWORD>(export_table.Name - relocation_offset);
+                auto offset_pointer_table = [&](size_t rva, size_t size) {
+                    std::span<DWORD> table{
+                        get_ptr<DWORD>(executable + rva + virtual_raw_offset),
+                        size,
+                    };
+                    for (DWORD& table_entry : table)
+                    {
+                        if (table_entry > 0)
+                        {
+                            table_entry = static_cast<DWORD>(table_entry - relocation_offset);
+                        }
+                    }
+                };
+                offset_pointer_table(export_table.AddressOfFunctions, export_table.NumberOfFunctions);
+                offset_pointer_table(export_table.AddressOfNames, export_table.NumberOfNames);
+
+                break;
+            }
             case DataDirectoryEntry::IMPORT:
                 [[fallthrough]];
             case DataDirectoryEntry::RESOURCE:
@@ -887,7 +908,8 @@ int main(int argc, char* argv[])
                                             headers.image_optional_header,
                                             headers.image_section_headers,
                                             bundle_extraction_result.text_section_start,
-                                            bundle_extraction_result.relocation_offset));
+                                            bundle_extraction_result.relocation_offset,
+                                            exe_data.data()));
 
         (void)as_value(patch_main(logger,
                                   exe_data,
