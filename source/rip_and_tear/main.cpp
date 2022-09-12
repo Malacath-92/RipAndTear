@@ -351,41 +351,6 @@ expected<BundleExtractionResult> extract_bundle(Logger logger,
     };
 }
 
-void patch_absolute_addresses(Logger logger,
-                              std::span<IMAGE_SECTION_HEADER> image_section_headers,
-                              size_t relocation_offset,
-                              std::byte* executable)
-{
-    logger.verbose("Patching absolute addresses in sections...");
-    auto patch_sections_popper = logger.push_segment();
-    for (IMAGE_SECTION_HEADER& header : image_section_headers)
-    {
-        logger.verbose("Patching {}...", (const char*)header.Name);
-        auto patch_section_popper = logger.push_segment();
-
-        const size_t section_offset{ header.PointerToRawData };
-        const size_t section_size{ header.SizeOfRawData };
-        std::byte* section_data = executable + section_offset;
-
-        constexpr size_t absolute_memory_range_lower{ 0x162000000 };
-        constexpr size_t absolute_memory_range_upper{ 0x162ffffff };
-
-        std::span<size_t> image_as_aligned_eight_bytes{
-            span::bit_cast<size_t>(std::span<std::byte>{ section_data, section_size }),
-        };
-        size_t num_values_patched{};
-        for (size_t& value : image_as_aligned_eight_bytes)
-        {
-            if (value >= absolute_memory_range_lower && value <= absolute_memory_range_upper)
-            {
-                value = value - relocation_offset;
-                num_values_patched++;
-            }
-        }
-        logger.verbose("Patched {} addresses...", num_values_patched);
-    }
-}
-
 [[nodiscard]] expected<std::monostate> patch_data_directory(Logger& logger,
                                                             IMAGE_OPTIONAL_HEADER& image_optional_header,
                                                             std::span<IMAGE_SECTION_HEADER> image_section_headers,
@@ -455,6 +420,7 @@ void patch_absolute_addresses(Logger logger,
                 export_table.Name = static_cast<DWORD>(export_table.Name - relocation_offset);
                 export_table.AddressOfFunctions = static_cast<DWORD>(export_table.AddressOfFunctions - relocation_offset);
                 export_table.AddressOfNames = static_cast<DWORD>(export_table.AddressOfNames - relocation_offset);
+                export_table.AddressOfNameOrdinals = static_cast<DWORD>(export_table.AddressOfNameOrdinals - relocation_offset);
 
                 auto offset_pointer_table = [&](size_t rva, size_t size)
                 {
@@ -659,7 +625,35 @@ void patch_absolute_addresses(Logger logger,
             }
             case DataDirectoryEntry::DEBUG:
             {
-                logger.verbose("No work to be done on debug entry...");
+                logger.verbose("Patching debug directory...");
+                auto debug_section_popper = logger.push_segment();
+
+                IMAGE_DEBUG_DIRECTORY& debug_directory{ get_ref<IMAGE_DEBUG_DIRECTORY>(entry_start) };
+                debug_directory.AddressOfRawData = static_cast<DWORD>(debug_directory.AddressOfRawData - relocation_offset);
+                debug_directory.PointerToRawData = static_cast<DWORD>(debug_directory.PointerToRawData - relocation_offset);
+
+                if (debug_directory.Type != IMAGE_DEBUG_TYPE_CODEVIEW)
+                {
+                    return Error{
+                        "Unsupported type of debug entry...",
+                        FAILED_UNSUPPORTED_DEBUG_ENTRY,
+                    };
+                }
+
+#pragma warning(push)
+#pragma warning(disable : 4200)
+                struct IMAGE_DEBUG_CODEVIEW_DIRECTORY
+                {
+                    char Signature[0x4];
+                    BYTE Guid[0x10];
+                    DWORD Age;
+                    char PdbName[];
+                };
+#pragma warning(pop)
+                IMAGE_DEBUG_CODEVIEW_DIRECTORY& codeview_directory{ get_ref<IMAGE_DEBUG_CODEVIEW_DIRECTORY>(executable + debug_directory.PointerToRawData) };
+                logger.verbose("signature: {}", codeview_directory.Signature);
+                logger.verbose("pdb path: {}", codeview_directory.PdbName);
+
                 break;
             }
             case DataDirectoryEntry::TLS:
@@ -714,6 +708,41 @@ void patch_absolute_addresses(Logger logger,
     }
 
     return std::monostate{};
+}
+
+void patch_absolute_addresses(Logger logger,
+                              std::span<IMAGE_SECTION_HEADER> image_section_headers,
+                              size_t relocation_offset,
+                              std::byte* executable)
+{
+    logger.verbose("Patching stray absolute addresses in sections...");
+    auto patch_sections_popper = logger.push_segment();
+    for (IMAGE_SECTION_HEADER& header : image_section_headers)
+    {
+        logger.verbose("Patching {}...", (const char*)header.Name);
+        auto patch_section_popper = logger.push_segment();
+
+        const size_t section_offset{ header.PointerToRawData };
+        const size_t section_size{ header.SizeOfRawData };
+        std::byte* section_data = executable + section_offset;
+
+        constexpr size_t absolute_memory_range_lower{ 0x162000000 };
+        constexpr size_t absolute_memory_range_upper{ 0x162ffffff };
+
+        std::span<size_t> image_as_aligned_eight_bytes{
+            span::bit_cast<size_t>(std::span<std::byte>{ section_data, section_size }),
+        };
+        size_t num_values_patched{};
+        for (size_t& value : image_as_aligned_eight_bytes)
+        {
+            if (value >= absolute_memory_range_lower && value <= absolute_memory_range_upper)
+            {
+                value = value - relocation_offset;
+                num_values_patched++;
+            }
+        }
+        logger.verbose("Patched {} addresses...", num_values_patched);
+    }
 }
 
 [[nodiscard]] expected<std::monostate> patch_main(Logger& logger,
@@ -1006,17 +1035,17 @@ int main(int argc, char* argv[])
                                     options.debug_do_not_relocated.value_or(false)))
         };
 
-        patch_absolute_addresses(logger,
-                                 headers.image_section_headers,
-                                 bundle_extraction_result.relocation_offset,
-                                 exe_data.data());
-
         (void)as_value(patch_data_directory(logger,
                                             headers.image_optional_header,
                                             headers.image_section_headers,
                                             bundle_extraction_result.text_section_start,
                                             bundle_extraction_result.relocation_offset,
                                             exe_data.data()));
+
+        patch_absolute_addresses(logger,
+                                 headers.image_section_headers,
+                                 bundle_extraction_result.relocation_offset,
+                                 exe_data.data());
 
         (void)as_value(patch_main(logger,
                                   exe_data,
