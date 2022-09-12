@@ -868,6 +868,8 @@ void patch_absolute_addresses(Logger logger,
                 "\x48\xc7\x05\xff\xff\xff\xff\x00\x00\x00\x00" // MOV qword ptr [g_DataBundleSize], 0x0
                 "\x48\x8d\x05\xff\xff\xff\xff"                 // LEA RAX, [g_DataBundle]
                 "\x48\x89\x05\xff\xff\xff\xff"                 // MOV qword ptr [g_DataBundlePtr], RAX
+                "\x48\x83\xc4\x30"                             // ADD RSP, 0x30
+                "\x5d"                                         // POP RBP
                 "\xc3"                                         // RET
                 ""sv
             };
