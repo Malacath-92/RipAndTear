@@ -651,7 +651,7 @@ expected<BundleExtractionResult> extract_bundle(Logger logger,
                 };
 #pragma warning(pop)
                 IMAGE_DEBUG_CODEVIEW_DIRECTORY& codeview_directory{ get_ref<IMAGE_DEBUG_CODEVIEW_DIRECTORY>(executable + debug_directory.PointerToRawData) };
-                logger.verbose("signature: {}", codeview_directory.Signature);
+                logger.verbose("signature: {}", std::string_view{ codeview_directory.Signature, 4 });
                 logger.verbose("pdb path: {}", codeview_directory.PdbName);
 
                 break;
