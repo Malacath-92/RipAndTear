@@ -15,6 +15,16 @@ include(cmake/clang-format.cmake)
 setup_format_target(format_rip_and_tear)
 
 # --------------------------------------------------
+# Setup IWYU
+set(IWYU_MAPPING_FILE ${CMAKE_SOURCE_DIR}/iwyu/rip_and_tear.3rdparty.headers.imp)
+set(POST_IWYU_FORMATTING_TARGET format_rip_and_tear_changes)
+include(cmake/include-what-you-use.cmake)
+
+# --------------------------------------------------
+# Add the convenience for linking system libraries
+include(cmake/link-sys-library.cmake)
+
+# --------------------------------------------------
 # Get version tag
 include(cmake/git-version.cmake)
 get_git_version(RIP_AND_TEAR_GIT_VERSION)
@@ -29,6 +39,10 @@ run_conan()
 find_package(structopt CONFIG REQUIRED)
 find_package(magic_enum CONFIG REQUIRED)
 find_package(fmt CONFIG REQUIRED)
+
+# --------------------------------------------------
+# Add submodules
+add_subdirectory(submodules)
 
 # --------------------------------------------------
 # Create interface libs

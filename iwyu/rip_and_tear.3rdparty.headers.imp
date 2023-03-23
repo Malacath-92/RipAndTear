@@ -1,0 +1,7 @@
+[
+  { ref: "stl.c.headers.imp" },
+  { ref: "stl.cpp.msvc.headers.imp" },
+  { ref: "win32.headers.imp" },
+
+  { include: [ "<fmt/core.h>", private, "<fmt/format.h>", public ] },
+]

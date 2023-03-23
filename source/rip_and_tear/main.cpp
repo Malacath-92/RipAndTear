@@ -367,16 +367,22 @@ expected<BundleExtractionResult> extract_bundle(Logger logger,
         {
             data_directory.VirtualAddress = static_cast<DWORD>(data_directory.VirtualAddress - relocation_offset);
 
-            const IMAGE_SECTION_HEADER* containing_section = algo::find_if(
-                image_section_headers,
-                [&](const IMAGE_SECTION_HEADER& image_section_headers)
-                {
-                    // clang-format off
-                    return image_section_headers.VirtualAddress <= data_directory.VirtualAddress
-                        && image_section_headers.VirtualAddress + image_section_headers.Misc.VirtualSize > data_directory.VirtualAddress;
-                    // clang-format on
-                });
+            auto get_image_section_header_from_virtual_address = [&](const size_t virtual_address)
+            {
+                return algo::find_if(
+                    image_section_headers,
+                    [&](const IMAGE_SECTION_HEADER& image_section_headers)
+                    {
+                        // clang-format off
+                        return image_section_headers.VirtualAddress <= virtual_address
+                            && image_section_headers.VirtualAddress + image_section_headers.Misc.VirtualSize > virtual_address;
+                        // clang-format on
+                    });
+            };
 
+            const IMAGE_SECTION_HEADER* containing_section{
+                get_image_section_header_from_virtual_address(data_directory.VirtualAddress)
+            };
             if (containing_section == nullptr)
             {
                 return Error{
@@ -608,12 +614,83 @@ expected<BundleExtractionResult> extract_bundle(Logger logger,
                 std::byte* reloc_table_data{ entry_start };
                 while (true)
                 {
-                    DWORD& page_offset{ get_ref_and_advance<DWORD>(reloc_table_data) };
-                    if (page_offset > 0)
+                    IMAGE_BASE_RELOCATION& relocation{ get_ref_and_advance<IMAGE_BASE_RELOCATION>(reloc_table_data) };
+                    if (relocation.VirtualAddress > 0)
                     {
-                        page_offset = static_cast<DWORD>(page_offset - relocation_offset);
-                        DWORD& reloc_block_size{ get_ref_and_advance<DWORD>(reloc_table_data) };
-                        reloc_table_data += reloc_block_size - sizeof(page_offset) - sizeof(reloc_block_size);
+                        relocation.VirtualAddress = static_cast<DWORD>(relocation.VirtualAddress - relocation_offset);
+                        const IMAGE_SECTION_HEADER* relocation_block_section{
+                            get_image_section_header_from_virtual_address(relocation.VirtualAddress)
+                        };
+                        const ptrdiff_t relocation_block_virtual_raw_offset{
+                            static_cast<ptrdiff_t>(relocation_block_section->PointerToRawData) - relocation_block_section->VirtualAddress
+                        };
+                        std::byte* const relocation_block{
+                            executable + relocation.VirtualAddress + relocation_block_virtual_raw_offset
+                        };
+
+                        struct RELOCATION_ENTRY
+                        {
+                            WORD RelocationType : 4;
+                            WORD RelocationRVA : 12;
+                        };
+                        static_assert(sizeof(RELOCATION_ENTRY) == sizeof(WORD));
+                        const size_t number_relocation_entries{ (relocation.SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(RELOCATION_ENTRY) };
+                        std::span<RELOCATION_ENTRY> relocations_in_block{
+                            get_ptr_and_advance<RELOCATION_ENTRY>(reloc_table_data, number_relocation_entries),
+                            number_relocation_entries,
+                        };
+                        for (RELOCATION_ENTRY& reloc_entry : relocations_in_block)
+                        {
+                            enum class RelocationType
+                            {
+                                ABS = IMAGE_REL_BASED_ABSOLUTE,
+                                HIGH = IMAGE_REL_BASED_HIGH,
+                                LOW = IMAGE_REL_BASED_LOW,
+                                HIGHLOW = IMAGE_REL_BASED_HIGHLOW,
+                                HIGHADJ = IMAGE_REL_BASED_HIGHADJ,
+                                MACHINE_SPECIFIC_5 = IMAGE_REL_BASED_MACHINE_SPECIFIC_5,
+                                RESERVED = IMAGE_REL_BASED_RESERVED,
+                                MACHINE_SPECIFIC_7 = IMAGE_REL_BASED_MACHINE_SPECIFIC_7,
+                                MACHINE_SPECIFIC_8 = IMAGE_REL_BASED_MACHINE_SPECIFIC_8,
+                                MACHINE_SPECIFIC_9 = IMAGE_REL_BASED_MACHINE_SPECIFIC_9,
+                                DIR64 = IMAGE_REL_BASED_DIR64,
+                            };
+                            std::byte* const relocation_addr{
+                                relocation_block + reloc_entry.RelocationRVA
+                            };
+                            (void)relocation_addr;
+                            const RelocationType reloc_type{ static_cast<RelocationType>(reloc_entry.RelocationType) };
+                            switch (reloc_type)
+                            {
+                            case RelocationType::ABS:
+                                break;
+                            case RelocationType::MACHINE_SPECIFIC_8:
+                                break;
+                            case RelocationType::HIGH:
+                                [[fallthrough]];
+                            case RelocationType::LOW:
+                                [[fallthrough]];
+                            case RelocationType::HIGHLOW:
+                                [[fallthrough]];
+                            case RelocationType::HIGHADJ:
+                                [[fallthrough]];
+                            case RelocationType::MACHINE_SPECIFIC_5:
+                                [[fallthrough]];
+                            case RelocationType::RESERVED:
+                                [[fallthrough]];
+                            case RelocationType::MACHINE_SPECIFIC_7:
+                                [[fallthrough]];
+                            case RelocationType::MACHINE_SPECIFIC_9:
+                                [[fallthrough]];
+                            case RelocationType::DIR64:
+                                [[fallthrough]];
+                            default:
+                                return Error{
+                                    fmt::format("Relocation Type '{}' is not supported...", magic_enum::enum_name(reloc_type)),
+                                    FAILED_UNSUPPORTED_RELOCATION_TYPE,
+                                };
+                            }
+                        }
                     }
                     else
                     {
@@ -673,9 +750,10 @@ expected<BundleExtractionResult> extract_bundle(Logger logger,
                 logger.verbose("Patching load config table...");
 
                 IMAGE_LOAD_CONFIG_DIRECTORY& load_config_directory{ get_ref<IMAGE_LOAD_CONFIG_DIRECTORY>(entry_start) };
-                load_config_directory.SecurityCookie = load_config_directory.SecurityCookie - relocation_offset;
+                load_config_directory.SecurityCookie = 0;
                 load_config_directory.GuardCFCheckFunctionPointer = load_config_directory.GuardCFCheckFunctionPointer - relocation_offset;
                 load_config_directory.GuardCFDispatchFunctionPointer = load_config_directory.GuardCFDispatchFunctionPointer - relocation_offset;
+                load_config_directory.GuardFlags |= IMAGE_GUARD_SECURITY_COOKIE_UNUSED;
 
                 // TODO: More to do here? Set the IMAGE_GUARD_SECURITY_COOKIE_UNUSED flag?
 
@@ -1070,8 +1148,6 @@ int main(int argc, char* argv[])
         };
         write_binary(logger, exe_data, out_path);
 
-        // TODO: Find absolute addresses in binary and patch those
-        // TODO: Check which image dos header members need to change (?page size?)
         // TODO: Patch function reading assets (https://gist.github.com/iojon/0bb1e95bad8b601025bfac14e07d8b25)
     }
     catch (const RipException& e)
