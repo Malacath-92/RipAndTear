@@ -1,5 +1,4 @@
 cmake_minimum_required(VERSION 3.17)
-project(RipAndTear LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF)
@@ -8,6 +7,25 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 set(CMAKE_MODULE_PATH ${CMAKE_BINARY_DIR} ${CMAKE_MODULE_PATH})
 set(CMAKE_PREFIX_PATH ${CMAKE_BINARY_DIR} ${CMAKE_PREFIX_PATH})
 set_property(GLOBAL PROPERTY USE_FOLDERS ON)
+
+# --------------------------------------------------
+# Run conan, needs to happen before project definition
+include(cmake/conan.cmake)
+set(CONAN_INSTALL_ARGS
+	--build=missing
+	-s:a onnxruntime/*:compiler.cppstd=17
+	-s:a protobuf/*:compiler.cppstd=17
+	-s:a onnx/*:compiler.cppstd=17
+	-s:a abseil/*:compiler.cppstd=17
+	-s:a re2/*:compiler.cppstd=17)
+run_conan(
+    HOST_PROFILE default auto-cmake
+    BUILD_PROFILE default
+    INSTALL_ARGS ${CONAN_INSTALL_ARGS}
+)
+# --------------------------------------------------
+# Define project
+project(RipAndTear LANGUAGES CXX)
 
 # --------------------------------------------------
 # Add formatting target
@@ -28,11 +46,6 @@ include(cmake/link-sys-library.cmake)
 # Get version tag
 include(cmake/git-version.cmake)
 get_git_version(RIP_AND_TEAR_GIT_VERSION)
-
-# --------------------------------------------------
-# Run conan
-include(cmake/conan.cmake)
-run_conan()
 
 # --------------------------------------------------
 # Find packages

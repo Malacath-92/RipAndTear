@@ -40,7 +40,7 @@ struct Logger
     }
 
     template<class... Args>
-    void verbose(const char* fmt, Args&&... args)
+    void verbose(fmt::format_string<Args...> fmt, Args&&... args)
     {
         if (is_verbose)
         {
@@ -50,14 +50,14 @@ struct Logger
         }
     }
     template<class... Args>
-    void warning(const char* fmt, Args&&... args)
+    void warning(fmt::format_string<Args...> fmt, Args&&... args)
     {
         fmt::print(fmt::fg(fmt::color::yellow), "{:\t>{}}", "Warning: ", segment_depth);
         fmt::print(fmt::fg(fmt::color::yellow), fmt, std::forward<Args>(args)...);
         fmt::print("\n");
     }
     template<class... Args>
-    void error(const char* fmt, Args&&... args)
+    void error(fmt::format_string<Args...> fmt, Args&&... args)
     {
         fmt::print(fmt::fg(fmt::color::red), "{:\t>{}}", "Error: ", segment_depth);
         fmt::print(fmt::fg(fmt::color::red), fmt, std::forward<Args>(args)...);
