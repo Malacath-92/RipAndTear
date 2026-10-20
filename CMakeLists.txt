@@ -52,6 +52,7 @@ get_git_version(RIP_AND_TEAR_GIT_VERSION)
 find_package(structopt CONFIG REQUIRED)
 find_package(magic_enum CONFIG REQUIRED)
 find_package(fmt CONFIG REQUIRED)
+find_package(zstd CONFIG REQUIRED)
 
 # --------------------------------------------------
 # Add submodules
@@ -120,14 +121,15 @@ target_precompile_headers(rip_and_tear_pch INTERFACE
 # --------------------------------------------------
 # Create rip_and_tear executbale
 file(GLOB_RECURSE rip_and_tear_sources CONFIGURE_DEPENDS "source/rip_and_tear/*.cpp")
-file(GLOB_RECURSE rip_and_tear_headers CONFIGURE_DEPENDS "source/rip_and_tear/*.h" "source/rip_and_tear/*.inl")
+file(GLOB_RECURSE rip_and_tear_headers CONFIGURE_DEPENDS "source/rip_and_tear/*.h" "source/rip_and_tear/*.hpp" "source/rip_and_tear/*.inl")
 set(rip_and_tear_resources "res/rip_and_tear.rc")
 add_executable(rip_and_tear ${rip_and_tear_sources} ${shared_sources} ${rip_and_tear_headers} ${shared_headers} ${rip_and_tear_resources})
 target_link_libraries(rip_and_tear PRIVATE
 	rip_and_tear_warnings
 	rip_and_tear_definitions
 	rip_and_tear_dependencies
-	rip_and_tear_pch)
+	rip_and_tear_pch
+	zstd::libzstd_static)
 target_include_directories(rip_and_tear PRIVATE "source/rip_and_tear" "res")
 
 # --------------------------------------------------

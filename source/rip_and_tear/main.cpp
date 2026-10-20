@@ -1,3 +1,4 @@
+﻿#include "asset_extractor.hpp"
 #include "unwind_info.h"
 #include "util/algorithms.h"
 #include "util/error.h"
@@ -22,10 +23,18 @@ struct CommandLineOptions
     std::optional<std::string> output_name{ "Mick2.exe" };
     std::optional<bool> insert_debug_interrupts{ false };
     std::optional<bool> debug_do_not_relocated{ false };
+    std::optional<bool> extract_assets{ false };
     std::optional<int32_t> exit_reason;
     std::optional<bool> verbose{ false };
 };
-VISITABLE_STRUCT(CommandLineOptions, exe_dir, output_name, insert_debug_interrupts, debug_do_not_relocated, exit_reason, verbose);
+VISITABLE_STRUCT(CommandLineOptions,
+                 exe_dir,
+                 output_name,
+                 insert_debug_interrupts,
+                 debug_do_not_relocated,
+                 extract_assets,
+                 exit_reason,
+                 verbose);
 
 struct Logger
 {
@@ -1148,7 +1157,45 @@ int main(int argc, char* argv[])
         };
         write_binary(logger, exe_data, out_path);
 
-        // TODO: Patch function reading assets (https://gist.github.com/iojon/0bb1e95bad8b601025bfac14e07d8b25)
+        if (options.extract_assets.value_or(false))
+        {
+            const AssetExtractionReport extraction_report{
+                ExtractAssetBundle(
+                    bundle_extraction_result.bundle_data,
+                    out_path.parent_path(),
+                    [](const size_t completed, const size_t total)
+                    {
+                        if (completed % 16 == 0 || completed == total)
+                        {
+                            fmt::print("Extracted {}/{} assets...\n", completed, total);
+                        }
+                    })
+            };
+            fmt::print("Extraction complete: {} of {} recognized assets, {} output bytes.\n",
+                       extraction_report.extracted_asset_count,
+                       extraction_report.matched_asset_count,
+                       extraction_report.extracted_file_bytes);
+            fmt::print("Bundle audit: {} bytes total; {} bytes in {} records; {} bytes of inter-record padding; {} terminator bytes; {} trailing padding bytes; {} unclassified bytes.\n",
+                       extraction_report.bundle_bytes,
+                       extraction_report.record_bytes,
+                       extraction_report.record_count,
+                       extraction_report.inter_record_padding_bytes,
+                       extraction_report.terminator_bytes,
+                       extraction_report.trailing_padding_bytes,
+                       extraction_report.unclassified_bytes);
+            fmt::print("Unrecognized path hashes: {} records, {} record bytes.\n",
+                       extraction_report.unrecognized_record_count,
+                       extraction_report.unrecognized_record_bytes);
+            for (const UnrecognizedAssetInfo& asset : extraction_report.unrecognized_assets)
+            {
+                fmt::print("  Offset {:#x}: hash={}, payload={} bytes, encrypted={}\n",
+                           asset.bundle_offset,
+                           asset.filepath_hash,
+                           asset.payload_size,
+                           asset.encrypted);
+            }
+            fmt::print("Output directory: '{}'\n", out_path.parent_path().string());
+        }
     }
     catch (const RipException& e)
     {
