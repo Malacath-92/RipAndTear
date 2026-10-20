@@ -8,9 +8,13 @@
 #include "util/span_util.h"
 
 #include <Windows.h>
+#include <array>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
+#include <imagehlp.h>
 #include <iostream>
+#include <numeric>
 #include <span>
 
 #include <structopt/app.hpp>
@@ -22,7 +26,7 @@ struct CommandLineOptions
     std::optional<std::string> exe_dir;
     std::optional<std::string> output_name{ "Mick2.exe" };
     std::optional<bool> insert_debug_interrupts{ false };
-    std::optional<bool> debug_do_not_relocated{ false };
+    std::optional<bool> debug_do_not_relocate{ false };
     std::optional<bool> extract_assets{ false };
     std::optional<int32_t> exit_reason;
     std::optional<bool> verbose{ false };
@@ -31,7 +35,7 @@ VISITABLE_STRUCT(CommandLineOptions,
                  exe_dir,
                  output_name,
                  insert_debug_interrupts,
-                 debug_do_not_relocated,
+                 debug_do_not_relocate,
                  extract_assets,
                  exit_reason,
                  verbose);
@@ -157,6 +161,21 @@ std::byte* find_pattern(std::span<std::byte> executable, std::string_view patter
     return nullptr;
 }
 
+[[nodiscard]] const IMAGE_SECTION_HEADER* find_section_for_rva(
+    std::span<const IMAGE_SECTION_HEADER> image_section_headers,
+    size_t virtual_address)
+{
+    for (const IMAGE_SECTION_HEADER& header : image_section_headers)
+    {
+        if (header.VirtualAddress <= virtual_address &&
+            virtual_address < header.VirtualAddress + header.Misc.VirtualSize)
+        {
+            return &header;
+        }
+    }
+    return nullptr;
+}
+
 expected<std::filesystem::path> get_exe_path(const CommandLineOptions& options)
 {
     namespace fs = std::filesystem;
@@ -247,30 +266,41 @@ expected<PortableExecutableHeaders> get_headers(Logger& logger, std::byte* execu
 
 struct BundleExtractionResult
 {
-    size_t text_section_start;
     size_t relocation_offset;
     std::vector<std::byte> bundle_data;
 };
 expected<BundleExtractionResult> extract_bundle(Logger logger,
                                                 IMAGE_OPTIONAL_HEADER& image_optional_header,
-                                                std::span<IMAGE_SECTION_HEADER> image_section_headers,
+                                                IMAGE_FILE_HEADER& image_file_header,
+                                                std::span<IMAGE_SECTION_HEADER>& image_section_headers,
                                                 std::byte* executable,
-                                                bool debug_do_not_relocated)
+                                                bool debug_do_not_relocate)
 {
     using namespace std::string_view_literals;
 
     logger.verbose("Begin patching headers and relocating sections...");
     auto image_headers_popper = logger.push_segment();
 
-    size_t text_section_start{};
     size_t relocation_offset{};
     std::vector<std::byte> bundle_data{};
+    bool text_section_found{};
+    bool text_virtual_size_fixed{};
+    DWORD text_section_virtual_address{};
 
-    // Extract resource bundle and shift all sections
+    // Remove the embedded bundle from the file while preserving every RVA.
+    //
+    // The bundle lives at the start of .text raw data, followed by the actual
+    // code. We copy the bundle out, then move the raw bytes left by
+    // relocation_offset. To keep the code at its original RVA, .text's
+    // VirtualAddress is moved right by exactly the same amount. All following
+    // sections keep their VirtualAddress and only their PointerToRawData moves.
+    // That leaves every RVA (and every absolute VA) untouched, so no .pdata,
+    // FuncInfo, import, relocation, TLS, or load-config metadata needs rebasing.
     for (IMAGE_SECTION_HEADER& header : image_section_headers)
     {
-        if (bundle_data.empty() && (const char*)header.Name == ".text"sv)
+        if (!text_section_found && (const char*)header.Name == ".text"sv)
         {
+            text_section_found = true;
             logger.verbose("Found .text section...");
             auto text_header_popper = logger.push_segment();
             logger.verbose("Extracting data bundle...");
@@ -280,20 +310,44 @@ expected<BundleExtractionResult> extract_bundle(Logger logger,
             std::byte* const bundle_data_start{ executable + bundle_data_offset };
             const size_t bundle_size{ get_data_bunde_size(bundle_data_start) };
 
-            if (debug_do_not_relocated)
+            if (debug_do_not_relocate)
             {
                 relocation_offset = 0;
             }
             else
             {
-                // Align to the value specified in the header
-                relocation_offset = bundle_size & ~(static_cast<size_t>(image_optional_header.FileAlignment) - 1);
+                // Round the removal offset DOWN to a multiple of both section and
+                // file alignment. It must not be rounded up: the bundle is
+                // immediately followed by live code, and removing even one byte
+                // more than necessary would chop the first function's prologue.
+                // SectionAlignment is normally a multiple of FileAlignment, but
+                // using lcm keeps every section's PointerToRawData aligned even if
+                // that assumption does not hold.
+                const size_t section_alignment{ static_cast<size_t>(image_optional_header.SectionAlignment) };
+                const size_t file_alignment{ static_cast<size_t>(image_optional_header.FileAlignment) };
+                const size_t alignment{ std::lcm(section_alignment, file_alignment) };
+                relocation_offset = (bundle_size / alignment) * alignment;
             }
 
             logger.verbose("Found data bundle of size {:#x}...", bundle_size);
             logger.verbose("Aligning to {:#x} bytes, resulting in {:#x}...", image_optional_header.FileAlignment, relocation_offset);
 
-            // Move bundle into it's own data
+            if (relocation_offset > bundle_size)
+            {
+                return Error{
+                    "Removal offset overlaps the first code function...",
+                    FAILED_UNEXPECTED_TEXT_SECTION,
+                };
+            }
+            if (relocation_offset > header.SizeOfRawData)
+            {
+                return Error{
+                    "Removal offset is larger than the .text raw data...",
+                    FAILED_UNEXPECTED_TEXT_SECTION,
+                };
+            }
+
+            // Move bundle into its own data
             bundle_data.resize(bundle_size);
             std::memmove(bundle_data.data(), bundle_data_start, bundle_size);
             std::memset(bundle_data_start, 0, bundle_size);
@@ -301,40 +355,75 @@ expected<BundleExtractionResult> extract_bundle(Logger logger,
             logger.verbose("Extracted data bundle...");
             logger.verbose("Relocating {} section...", (const char*)header.Name);
 
-            // Move the old data up by size of the bundle
+            // Move the raw data left. The source may be inside the now-zeroed
+            // bundle region, which is fine: those bytes become leading zero
+            // padding in .text. It must never be inside live code, which is
+            // guaranteed by relocation_offset <= bundle_size.
             const size_t remaining_text_size{ header.SizeOfRawData - relocation_offset };
-            header.Misc.VirtualSize = static_cast<DWORD>(header.Misc.VirtualSize - relocation_offset);
-            header.SizeOfRawData = static_cast<DWORD>(header.SizeOfRawData - relocation_offset);
+            header.SizeOfRawData = static_cast<DWORD>(remaining_text_size);
             std::memmove(bundle_data_start, bundle_data_start + relocation_offset, remaining_text_size);
             std::memset(bundle_data_start + remaining_text_size, 0, relocation_offset);
 
+            // Keep the code's virtual addresses unchanged. The code moved left
+            // by relocation_offset in the file, so the section base moves right
+            // by relocation_offset in the virtual address space.
+            text_section_virtual_address = header.VirtualAddress;
+            header.VirtualAddress = static_cast<DWORD>(header.VirtualAddress + relocation_offset);
+
             logger.verbose("Fixing image optional header...");
 
-            // Fix up the header
-            image_optional_header.SizeOfImage = static_cast<DWORD>(image_optional_header.SizeOfImage - relocation_offset);
+            // SizeOfImage is unchanged: the highest section still ends at the
+            // same VA. The removed bundle leaves a gap before .text; that gap
+            // is covered by an uninitialized .gap section below so the Windows
+            // loader accepts the image. AddressOfEntryPoint is an RVA and is
+            // also unchanged.
+            if (image_optional_header.SizeOfCode < relocation_offset)
+            {
+                return Error{
+                    "Removal offset is larger than SizeOfCode...",
+                    FAILED_UNEXPECTED_TEXT_SECTION,
+                };
+            }
             image_optional_header.SizeOfCode = static_cast<DWORD>(image_optional_header.SizeOfCode - relocation_offset);
-            image_optional_header.AddressOfEntryPoint = static_cast<DWORD>(image_optional_header.AddressOfEntryPoint - relocation_offset);
-
-            // Remember the start of the .text section
-            text_section_start = bundle_data_offset;
+            image_optional_header.BaseOfCode = header.VirtualAddress;
         }
-        else if (text_section_start > 0)
+        else if (text_section_found)
         {
             logger.verbose("Found {} section...", (const char*)header.Name);
             auto section_header_popper = logger.push_segment();
-            logger.verbose("Relocating section...");
+            logger.verbose("Relocating section raw data...");
 
-            // Move the whole section up by the aligned size of the bundle
+            // Move only the raw bytes. The VirtualAddress stays put, so all
+            // RVAs that point into this section remain valid.
+            if (header.PointerToRawData < relocation_offset)
+            {
+                return Error{
+                    "Section raw data starts before the moved data...",
+                    FAILED_UNEXPECTED_TEXT_SECTION,
+                };
+            }
+
             const size_t section_offset{ header.PointerToRawData };
             std::byte* const section_start{ executable + section_offset };
             std::byte* const section_end{ executable + section_offset + header.SizeOfRawData };
-            header.VirtualAddress = static_cast<DWORD>(header.VirtualAddress - relocation_offset);
-            header.PointerToRawData = static_cast<DWORD>(header.PointerToRawData - relocation_offset);
+            header.PointerToRawData = static_cast<DWORD>(section_offset - relocation_offset);
             std::memmove(section_start - relocation_offset, section_start, header.SizeOfRawData);
             std::byte* const new_section_end{ section_start - relocation_offset + header.SizeOfRawData };
             std::byte* const zero_memory_begin{ std::max(section_start, new_section_end) };
             const size_t zero_memory_size{ static_cast<size_t>(section_end - zero_memory_begin) };
             std::memset(zero_memory_begin, 0, zero_memory_size);
+
+            // VirtualSize must span the full virtual extent of .text, including
+            // any inter-section padding. Its VirtualAddress has already been
+            // moved forward, so the distance to the next section is the correct
+            // new size. We only do this once (first section after .text).
+            IMAGE_SECTION_HEADER& text_header{ image_section_headers.data()[0] };
+            if (!text_virtual_size_fixed)
+            {
+                text_header.Misc.VirtualSize = header.VirtualAddress - text_header.VirtualAddress;
+                logger.verbose("Fixed .text VirtualSize to {:#x}...", text_header.Misc.VirtualSize);
+                text_virtual_size_fixed = true;
+            }
         }
         else
         {
@@ -345,7 +434,7 @@ expected<BundleExtractionResult> extract_bundle(Logger logger,
         }
     }
 
-    if (text_section_start == 0)
+    if (!text_section_found)
     {
         return Error{
             "Could not find .text section...",
@@ -353,8 +442,52 @@ expected<BundleExtractionResult> extract_bundle(Logger logger,
         };
     }
 
+    if (relocation_offset != 0)
+    {
+        // The change leaves the removed bundle's RVA range uncovered. The
+        // Windows loader rejects an image with an unbacked gap between the
+        // headers and the first section, so add a zero-filled .gap section
+        // covering exactly that range. It has no file data, so the executable
+        // stays small; the loader maps it as demand-zero virtual memory.
+        const size_t section_table_offset{
+            static_cast<size_t>(reinterpret_cast<const std::byte*>(image_section_headers.data()) - executable)
+        };
+        const size_t section_count{ image_section_headers.size() };
+        const size_t new_section_table_end{
+            section_table_offset + (section_count + 1) * sizeof(IMAGE_SECTION_HEADER)
+        };
+        if (new_section_table_end > image_optional_header.SizeOfHeaders)
+        {
+            return Error{
+                "No room in the PE headers for the .gap section...",
+                FAILED_UNEXPECTED_TEXT_SECTION,
+            };
+        }
+
+        std::memmove(image_section_headers.data() + 1,
+                     image_section_headers.data(),
+                     section_count * sizeof(IMAGE_SECTION_HEADER));
+
+        IMAGE_SECTION_HEADER& gap_header{ image_section_headers.data()[0] };
+        std::memset(&gap_header, 0, sizeof(IMAGE_SECTION_HEADER));
+        std::memcpy(gap_header.Name, ".gap", 4);
+        gap_header.Misc.VirtualSize = static_cast<DWORD>(relocation_offset);
+        gap_header.VirtualAddress = text_section_virtual_address;
+        gap_header.Characteristics = IMAGE_SCN_CNT_UNINITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE;
+
+        image_section_headers = std::span<IMAGE_SECTION_HEADER>{
+            image_section_headers.data(),
+            section_count + 1,
+        };
+        ++image_file_header.NumberOfSections;
+        image_optional_header.SizeOfUninitializedData += static_cast<DWORD>(relocation_offset);
+
+        logger.verbose("Added .gap section at RVA {:#x}, size {:#x}...",
+                       gap_header.VirtualAddress,
+                       gap_header.Misc.VirtualSize);
+    }
+
     return BundleExtractionResult{
-        text_section_start,
         relocation_offset,
         std::move(bundle_data),
     };
@@ -363,473 +496,91 @@ expected<BundleExtractionResult> extract_bundle(Logger logger,
 [[nodiscard]] expected<std::monostate> patch_data_directory(Logger& logger,
                                                             IMAGE_OPTIONAL_HEADER& image_optional_header,
                                                             std::span<IMAGE_SECTION_HEADER> image_section_headers,
-                                                            size_t text_section_start,
                                                             size_t relocation_offset,
                                                             std::byte* executable)
 {
-    logger.verbose("Patch data directory...");
+    logger.verbose("Patching file-offset data directories...");
     auto data_directory_popper{ logger.push_segment() };
 
-    for (const auto& [idx, data_directory] : algo::enumerate(image_optional_header.DataDirectory))
+    // The change preserves every RVA and every absolute VA. The only data
+    // directory whose payload stores a raw file offset is the debug directory:
+    // AddressOfRawData is an RVA (unchanged), while PointerToRawData is a file
+    // offset into a section whose raw data was moved left by relocation_offset.
+    const IMAGE_DATA_DIRECTORY& debug_data_directory{
+        image_optional_header.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG]
+    };
+    if (debug_data_directory.VirtualAddress == 0 || debug_data_directory.Size == 0)
     {
-        if (data_directory.VirtualAddress > text_section_start)
+        return std::monostate{};
+    }
+
+    const IMAGE_SECTION_HEADER* debug_section{
+        find_section_for_rva(image_section_headers, debug_data_directory.VirtualAddress)
+    };
+    if (debug_section == nullptr)
+    {
+        return Error{
+            "Debug data directory is not contained within a section...",
+            FAILED_MYSTERY_DATA_DIRECTORY,
+        };
+    }
+
+    const ptrdiff_t virtual_raw_offset{
+        static_cast<ptrdiff_t>(debug_section->PointerToRawData) - debug_section->VirtualAddress
+    };
+    std::byte* const entry_start{
+        executable + debug_data_directory.VirtualAddress + virtual_raw_offset
+    };
+
+    const size_t num_debug_entries{ debug_data_directory.Size / sizeof(IMAGE_DEBUG_DIRECTORY) };
+    std::span<IMAGE_DEBUG_DIRECTORY> debug_directories{
+        get_ptr<IMAGE_DEBUG_DIRECTORY>(entry_start),
+        num_debug_entries,
+    };
+
+    for (IMAGE_DEBUG_DIRECTORY& debug_directory : debug_directories)
+    {
+        if (debug_directory.PointerToRawData != 0)
         {
-            data_directory.VirtualAddress = static_cast<DWORD>(data_directory.VirtualAddress - relocation_offset);
-
-            auto get_image_section_header_from_virtual_address = [&](const size_t virtual_address)
-            {
-                return algo::find_if(
-                    image_section_headers,
-                    [&](const IMAGE_SECTION_HEADER& image_section_headers)
-                    {
-                        // clang-format off
-                        return image_section_headers.VirtualAddress <= virtual_address
-                            && image_section_headers.VirtualAddress + image_section_headers.Misc.VirtualSize > virtual_address;
-                        // clang-format on
-                    });
-            };
-
-            const IMAGE_SECTION_HEADER* containing_section{
-                get_image_section_header_from_virtual_address(data_directory.VirtualAddress)
-            };
-            if (containing_section == nullptr)
+            if (debug_directory.PointerToRawData < relocation_offset)
             {
                 return Error{
-                    "Data directory is not contained within a section...",
+                    "Debug raw data pointer is before the moved data...",
                     FAILED_MYSTERY_DATA_DIRECTORY,
                 };
             }
 
-            const ptrdiff_t virtual_raw_offset{ static_cast<ptrdiff_t>(containing_section->PointerToRawData) - containing_section->VirtualAddress };
-            const ptrdiff_t address_of_raw_data{ data_directory.VirtualAddress + virtual_raw_offset };
-            std::byte* const entry_start{ executable + address_of_raw_data };
+            // AddressOfRawData is an RVA and deliberately stays unchanged.
+            debug_directory.PointerToRawData = static_cast<DWORD>(
+                debug_directory.PointerToRawData - relocation_offset);
+        }
 
-            enum class DataDirectoryEntry
-            {
-                EXPORT = IMAGE_DIRECTORY_ENTRY_EXPORT,
-                IMPORT = IMAGE_DIRECTORY_ENTRY_IMPORT,
-                RESOURCE = IMAGE_DIRECTORY_ENTRY_RESOURCE,
-                EXCEPTION = IMAGE_DIRECTORY_ENTRY_EXCEPTION,
-                SECURITY = IMAGE_DIRECTORY_ENTRY_SECURITY,
-                BASERELOC = IMAGE_DIRECTORY_ENTRY_BASERELOC,
-                DEBUG = IMAGE_DIRECTORY_ENTRY_DEBUG,
-                ARCHITECTURE = IMAGE_DIRECTORY_ENTRY_ARCHITECTURE,
-                GLOBALPTR = IMAGE_DIRECTORY_ENTRY_GLOBALPTR,
-                TLS = IMAGE_DIRECTORY_ENTRY_TLS,
-                LOAD_CONFIG = IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG,
-                BOUND_IMPORT = IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT,
-                IAT = IMAGE_DIRECTORY_ENTRY_IAT,
-                DELAY_IMPORT = IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT,
-                COM_DESCRIPTOR = IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR,
-            };
-            DataDirectoryEntry data_directory_entry{ static_cast<DataDirectoryEntry>(idx) };
-
-            switch (data_directory_entry)
-            {
-            case DataDirectoryEntry::EXPORT:
-            {
-                logger.verbose("Patching export table...");
-                auto export_table_popper{ logger.push_segment() };
-
-                IMAGE_EXPORT_DIRECTORY& export_table{ get_ref<IMAGE_EXPORT_DIRECTORY>(entry_start) };
-                export_table.Name = static_cast<DWORD>(export_table.Name - relocation_offset);
-                export_table.AddressOfFunctions = static_cast<DWORD>(export_table.AddressOfFunctions - relocation_offset);
-                export_table.AddressOfNames = static_cast<DWORD>(export_table.AddressOfNames - relocation_offset);
-                export_table.AddressOfNameOrdinals = static_cast<DWORD>(export_table.AddressOfNameOrdinals - relocation_offset);
-
-                auto offset_pointer_table = [&](size_t rva, size_t size)
-                {
-                    std::span<DWORD> table{
-                        get_ptr<DWORD>(executable + rva + virtual_raw_offset),
-                        size,
-                    };
-                    for (DWORD& table_entry : table)
-                    {
-                        if (table_entry > 0)
-                        {
-                            table_entry = static_cast<DWORD>(table_entry - relocation_offset);
-                        }
-                    }
-                    return table;
-                };
-
-                if (logger.is_verbose)
-                {
-                    offset_pointer_table(export_table.AddressOfFunctions, export_table.NumberOfFunctions);
-                    const std::span<DWORD> names{ offset_pointer_table(export_table.AddressOfNames, export_table.NumberOfNames) };
-                    for (const DWORD name_rva : names)
-                    {
-                        const char* name{ reinterpret_cast<const char*>(executable + name_rva + virtual_raw_offset) };
-                        logger.verbose("Relocating exported function '{}'...", name);
-                    }
-                }
-
-                break;
-            }
-            case DataDirectoryEntry::IMPORT:
-            {
-                logger.verbose("Patching import table...");
-                auto import_table_popper{ logger.push_segment() };
-
-                std::span<IMAGE_IMPORT_DESCRIPTOR> import_desc_table{
-                    get_nullterminated_table<IMAGE_IMPORT_DESCRIPTOR>(entry_start)
-                };
-
-                for (IMAGE_IMPORT_DESCRIPTOR& import_desc : import_desc_table)
-                {
-                    import_desc.OriginalFirstThunk = static_cast<DWORD>(import_desc.OriginalFirstThunk - relocation_offset);
-                    import_desc.Name = static_cast<DWORD>(import_desc.Name - relocation_offset);
-                    import_desc.FirstThunk = static_cast<DWORD>(import_desc.FirstThunk - relocation_offset);
-
-                    const char* module_name{ reinterpret_cast<const char*>(executable + import_desc.Name + virtual_raw_offset) };
-                    logger.verbose("Relocating imported module '{}'...", module_name);
-                    auto import_module_popper{ logger.push_segment() };
-
-                    const ptrdiff_t original_thunk_table_address{ import_desc.OriginalFirstThunk + virtual_raw_offset };
-                    std::span<IMAGE_THUNK_DATA> original_thunk_table{
-                        get_nullterminated_table<IMAGE_THUNK_DATA>(executable + original_thunk_table_address)
-                    };
-                    for (IMAGE_THUNK_DATA& original_thunk : original_thunk_table)
-                    {
-                        using THUNK_T = decltype(decltype(IMAGE_THUNK_DATA::u1)::AddressOfData);
-                        constexpr THUNK_T ordinal_bit{ THUNK_T(1) << (sizeof(THUNK_T) * 8 - 1) };
-                        const bool is_ordinal{ (original_thunk.u1.AddressOfData & ordinal_bit) != 0 };
-                        if (is_ordinal)
-                        {
-                            const size_t ordinal{ original_thunk.u1.Ordinal & ~ordinal_bit };
-                            logger.verbose("No need to relocate imported function '{}::Ordinal.{}'...", module_name, ordinal);
-                        }
-                        else
-                        {
-                            original_thunk.u1.AddressOfData = static_cast<DWORD>(original_thunk.u1.AddressOfData - relocation_offset);
-                            IMAGE_IMPORT_BY_NAME* function_import_desc{
-                                reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(executable + original_thunk.u1.AddressOfData + virtual_raw_offset)
-                            };
-                            logger.verbose("Relocating imported function '{}::{}'...", module_name, function_import_desc->Name);
-                        }
-                    }
-
-                    const ptrdiff_t thunk_table_address{ import_desc.FirstThunk + virtual_raw_offset };
-                    std::span<size_t> thunk_table{
-                        get_nullterminated_table<size_t>(executable + thunk_table_address)
-                    };
-                    for (size_t& thunk : thunk_table)
-                    {
-                        thunk = thunk - relocation_offset;
-                    }
-
-                    if (import_desc.ForwarderChain != 0)
-                    {
-                        return Error{
-                            "Import forwarder chain is not supported...",
-                            FAILED_UNSUPPORTED_IMPORT_FORWARDER_CHAIN,
-                        };
-                    }
-                }
-
-                break;
-            }
-            case DataDirectoryEntry::RESOURCE:
-            {
-                logger.verbose("Patching resource directory...");
-                auto res_section_popper = logger.push_segment();
-
-                auto patch_directory_recursive = [&](std::byte* directory_data, auto& self) -> void
-                {
-                    IMAGE_RESOURCE_DIRECTORY& resource_directory = get_ref_and_advance<IMAGE_RESOURCE_DIRECTORY>(directory_data);
-                    for (size_t i = 0; i < resource_directory.NumberOfNamedEntries + resource_directory.NumberOfIdEntries; i++)
-                    {
-                        IMAGE_RESOURCE_DIRECTORY_ENTRY& resource_entry = get_ref_and_advance<IMAGE_RESOURCE_DIRECTORY_ENTRY>(directory_data);
-
-                        const bool named{ i < resource_directory.NumberOfNamedEntries };
-                        if (named)
-                        {
-                            if (resource_entry.NameIsString)
-                            {
-                                std::byte* const name_address{ entry_start + resource_entry.NameOffset };
-                                IMAGE_RESOURCE_DIR_STRING_U& name{ get_ref<IMAGE_RESOURCE_DIR_STRING_U>(name_address) };
-                                const std::string name_utf8{ algo::to_utf8(std::wstring{ name.NameString, name.Length }) };
-                                logger.verbose("Named: {}", name_utf8);
-                            }
-                            else
-                            {
-                                logger.verbose("Named: {}", (DWORD)resource_entry.NameOffset);
-                            }
-                        }
-                        else
-                        {
-                            logger.verbose("Id: {}", resource_entry.Id);
-                        }
-
-                        if (resource_entry.DataIsDirectory)
-                        {
-                            auto dir_popper = logger.push_segment();
-                            self(entry_start + resource_entry.OffsetToDirectory, self);
-                        }
-                        else
-                        {
-                            std::byte* const data_address{ entry_start + resource_entry.OffsetToData };
-                            IMAGE_RESOURCE_DATA_ENTRY& data_entry{ get_ref<IMAGE_RESOURCE_DATA_ENTRY>(data_address) };
-                            data_entry.OffsetToData = static_cast<DWORD>(data_entry.OffsetToData - relocation_offset);
-                        }
-                    }
-                };
-                logger.verbose("Root");
-                auto root_popper = logger.push_segment();
-                patch_directory_recursive(entry_start, patch_directory_recursive);
-
-                break;
-            }
-            case DataDirectoryEntry::EXCEPTION:
-            {
-                logger.verbose("Patching runtime function entries...");
-
-                std::span<IMAGE_RUNTIME_FUNCTION_ENTRY> image_runtime_function_array{
-                    get_nullterminated_table<IMAGE_RUNTIME_FUNCTION_ENTRY>(entry_start),
-                };
-                for (IMAGE_RUNTIME_FUNCTION_ENTRY& image_runtime_function_entry : image_runtime_function_array)
-                {
-                    if (image_runtime_function_entry.BeginAddress == 0)
-                    {
-                        break;
-                    }
-
-                    image_runtime_function_entry.BeginAddress = static_cast<DWORD>(image_runtime_function_entry.BeginAddress - relocation_offset);
-                    image_runtime_function_entry.EndAddress = static_cast<DWORD>(image_runtime_function_entry.EndAddress - relocation_offset);
-                    image_runtime_function_entry.UnwindInfoAddress = static_cast<DWORD>(image_runtime_function_entry.UnwindInfoAddress - relocation_offset);
-
-                    const size_t unwind_info_offset{ image_runtime_function_entry.UnwindInfoAddress };
-                    std::byte* const unwind_info_data = executable + unwind_info_offset;
-                    UNWIND_INFO& unwind_info{ get_ref<UNWIND_INFO>(unwind_info_data) };
-                    if (unwind_info.Flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER))
-                    {
-                        ULONG& except_handler_offset = *(PULONG)GetLanguageSpecificDataPtr(&unwind_info);
-                        except_handler_offset = static_cast<ULONG>(except_handler_offset - relocation_offset);
-                    }
-                    else if (unwind_info.Flags & UNW_FLAG_CHAININFO)
-                    {
-                        ULONG& chain_info_offset = *(PULONG)GetLanguageSpecificDataPtr(&unwind_info);
-                        chain_info_offset = static_cast<ULONG>(chain_info_offset - relocation_offset);
-                    }
-                }
-
-                // TODO: More to do here?
-                break;
-            }
-            case DataDirectoryEntry::BASERELOC:
-            {
-                logger.verbose("Patching relocation table...");
-
-                std::byte* reloc_table_data{ entry_start };
-                while (true)
-                {
-                    IMAGE_BASE_RELOCATION& relocation{ get_ref_and_advance<IMAGE_BASE_RELOCATION>(reloc_table_data) };
-                    if (relocation.VirtualAddress > 0)
-                    {
-                        relocation.VirtualAddress = static_cast<DWORD>(relocation.VirtualAddress - relocation_offset);
-                        const IMAGE_SECTION_HEADER* relocation_block_section{
-                            get_image_section_header_from_virtual_address(relocation.VirtualAddress)
-                        };
-                        const ptrdiff_t relocation_block_virtual_raw_offset{
-                            static_cast<ptrdiff_t>(relocation_block_section->PointerToRawData) - relocation_block_section->VirtualAddress
-                        };
-                        std::byte* const relocation_block{
-                            executable + relocation.VirtualAddress + relocation_block_virtual_raw_offset
-                        };
-
-                        struct RELOCATION_ENTRY
-                        {
-                            WORD RelocationType : 4;
-                            WORD RelocationRVA : 12;
-                        };
-                        static_assert(sizeof(RELOCATION_ENTRY) == sizeof(WORD));
-                        const size_t number_relocation_entries{ (relocation.SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(RELOCATION_ENTRY) };
-                        std::span<RELOCATION_ENTRY> relocations_in_block{
-                            get_ptr_and_advance<RELOCATION_ENTRY>(reloc_table_data, number_relocation_entries),
-                            number_relocation_entries,
-                        };
-                        for (RELOCATION_ENTRY& reloc_entry : relocations_in_block)
-                        {
-                            enum class RelocationType
-                            {
-                                ABS = IMAGE_REL_BASED_ABSOLUTE,
-                                HIGH = IMAGE_REL_BASED_HIGH,
-                                LOW = IMAGE_REL_BASED_LOW,
-                                HIGHLOW = IMAGE_REL_BASED_HIGHLOW,
-                                HIGHADJ = IMAGE_REL_BASED_HIGHADJ,
-                                MACHINE_SPECIFIC_5 = IMAGE_REL_BASED_MACHINE_SPECIFIC_5,
-                                RESERVED = IMAGE_REL_BASED_RESERVED,
-                                MACHINE_SPECIFIC_7 = IMAGE_REL_BASED_MACHINE_SPECIFIC_7,
-                                MACHINE_SPECIFIC_8 = IMAGE_REL_BASED_MACHINE_SPECIFIC_8,
-                                MACHINE_SPECIFIC_9 = IMAGE_REL_BASED_MACHINE_SPECIFIC_9,
-                                DIR64 = IMAGE_REL_BASED_DIR64,
-                            };
-                            std::byte* const relocation_addr{
-                                relocation_block + reloc_entry.RelocationRVA
-                            };
-                            (void)relocation_addr;
-                            const RelocationType reloc_type{ static_cast<RelocationType>(reloc_entry.RelocationType) };
-                            switch (reloc_type)
-                            {
-                            case RelocationType::ABS:
-                                break;
-                            case RelocationType::MACHINE_SPECIFIC_8:
-                                break;
-                            case RelocationType::HIGH:
-                                [[fallthrough]];
-                            case RelocationType::LOW:
-                                [[fallthrough]];
-                            case RelocationType::HIGHLOW:
-                                [[fallthrough]];
-                            case RelocationType::HIGHADJ:
-                                [[fallthrough]];
-                            case RelocationType::MACHINE_SPECIFIC_5:
-                                [[fallthrough]];
-                            case RelocationType::RESERVED:
-                                [[fallthrough]];
-                            case RelocationType::MACHINE_SPECIFIC_7:
-                                [[fallthrough]];
-                            case RelocationType::MACHINE_SPECIFIC_9:
-                                [[fallthrough]];
-                            case RelocationType::DIR64:
-                                [[fallthrough]];
-                            default:
-                                return Error{
-                                    fmt::format("Relocation Type '{}' is not supported...", magic_enum::enum_name(reloc_type)),
-                                    FAILED_UNSUPPORTED_RELOCATION_TYPE,
-                                };
-                            }
-                        }
-                    }
-                    else
-                    {
-                        break;
-                    }
-                }
-
-                break;
-            }
-            case DataDirectoryEntry::DEBUG:
-            {
-                logger.verbose("Patching debug directory...");
-                auto debug_section_popper = logger.push_segment();
-
-                IMAGE_DEBUG_DIRECTORY& debug_directory{ get_ref<IMAGE_DEBUG_DIRECTORY>(entry_start) };
-                debug_directory.AddressOfRawData = static_cast<DWORD>(debug_directory.AddressOfRawData - relocation_offset);
-                debug_directory.PointerToRawData = static_cast<DWORD>(debug_directory.PointerToRawData - relocation_offset);
-
-                if (debug_directory.Type != IMAGE_DEBUG_TYPE_CODEVIEW)
-                {
-                    return Error{
-                        "Unsupported type of debug entry...",
-                        FAILED_UNSUPPORTED_DEBUG_ENTRY,
-                    };
-                }
-
+        if (debug_directory.Type == IMAGE_DEBUG_TYPE_CODEVIEW &&
+            debug_directory.PointerToRawData != 0)
+        {
 #pragma warning(push)
 #pragma warning(disable : 4200)
-                struct IMAGE_DEBUG_CODEVIEW_DIRECTORY
-                {
-                    char Signature[0x4];
-                    BYTE Guid[0x10];
-                    DWORD Age;
-                    char PdbName[];
-                };
+            struct IMAGE_DEBUG_CODEVIEW_DIRECTORY
+            {
+                char Signature[0x4];
+                BYTE Guid[0x10];
+                DWORD Age;
+                char PdbName[];
+            };
 #pragma warning(pop)
-                IMAGE_DEBUG_CODEVIEW_DIRECTORY& codeview_directory{ get_ref<IMAGE_DEBUG_CODEVIEW_DIRECTORY>(executable + debug_directory.PointerToRawData) };
-                logger.verbose("signature: {}", std::string_view{ codeview_directory.Signature, 4 });
-                logger.verbose("pdb path: {}", codeview_directory.PdbName);
-
-                break;
-            }
-            case DataDirectoryEntry::TLS:
-            {
-                logger.verbose("Patching tls table...");
-
-                IMAGE_TLS_DIRECTORY& tls_directory{ get_ref<IMAGE_TLS_DIRECTORY>(entry_start) };
-                tls_directory.StartAddressOfRawData = tls_directory.StartAddressOfRawData - relocation_offset;
-                tls_directory.EndAddressOfRawData = tls_directory.EndAddressOfRawData - relocation_offset;
-                tls_directory.AddressOfIndex = tls_directory.AddressOfIndex - relocation_offset;
-                tls_directory.AddressOfCallBacks = tls_directory.AddressOfCallBacks - relocation_offset;
-
-                break;
-            }
-            case DataDirectoryEntry::LOAD_CONFIG:
-            {
-                logger.verbose("Patching load config table...");
-
-                IMAGE_LOAD_CONFIG_DIRECTORY& load_config_directory{ get_ref<IMAGE_LOAD_CONFIG_DIRECTORY>(entry_start) };
-                load_config_directory.SecurityCookie = 0;
-                load_config_directory.GuardCFCheckFunctionPointer = load_config_directory.GuardCFCheckFunctionPointer - relocation_offset;
-                load_config_directory.GuardCFDispatchFunctionPointer = load_config_directory.GuardCFDispatchFunctionPointer - relocation_offset;
-                load_config_directory.GuardFlags |= IMAGE_GUARD_SECURITY_COOKIE_UNUSED;
-
-                // TODO: More to do here? Set the IMAGE_GUARD_SECURITY_COOKIE_UNUSED flag?
-
-                break;
-            }
-            case DataDirectoryEntry::IAT:
-            {
-                logger.verbose("IAT entry already handled during import table handling...");
-                break;
-            }
-            case DataDirectoryEntry::SECURITY:
-                [[fallthrough]];
-            case DataDirectoryEntry::ARCHITECTURE:
-                [[fallthrough]];
-            case DataDirectoryEntry::GLOBALPTR:
-                [[fallthrough]];
-            case DataDirectoryEntry::BOUND_IMPORT:
-                [[fallthrough]];
-            case DataDirectoryEntry::DELAY_IMPORT:
-                [[fallthrough]];
-            case DataDirectoryEntry::COM_DESCRIPTOR:
-                [[fallthrough]];
-            default:
-                return Error{
-                    fmt::format("Data Directory Entry '{}' is not supported...", magic_enum::enum_name(data_directory_entry)),
-                    FAILED_UNSUPPORTED_DATA_DIRECTORY_ENTRY,
-                };
-            }
+            IMAGE_DEBUG_CODEVIEW_DIRECTORY& codeview_directory{
+                get_ref<IMAGE_DEBUG_CODEVIEW_DIRECTORY>(executable + debug_directory.PointerToRawData)
+            };
+            logger.verbose("codeview signature: {}", std::string_view{ codeview_directory.Signature, 4 });
+            logger.verbose("codeview pdb path: {}", codeview_directory.PdbName);
+        }
+        else
+        {
+            logger.verbose("Skipping debug entry of type {}...", debug_directory.Type);
         }
     }
 
     return std::monostate{};
-}
-
-void patch_absolute_addresses(Logger logger,
-                              std::span<IMAGE_SECTION_HEADER> image_section_headers,
-                              size_t relocation_offset,
-                              std::byte* executable)
-{
-    logger.verbose("Patching stray absolute addresses in sections...");
-    auto patch_sections_popper = logger.push_segment();
-    for (IMAGE_SECTION_HEADER& header : image_section_headers)
-    {
-        logger.verbose("Patching {}...", (const char*)header.Name);
-        auto patch_section_popper = logger.push_segment();
-
-        const size_t section_offset{ header.PointerToRawData };
-        const size_t section_size{ header.SizeOfRawData };
-        std::byte* section_data = executable + section_offset;
-
-        constexpr size_t absolute_memory_range_lower{ 0x162000000 };
-        constexpr size_t absolute_memory_range_upper{ 0x162ffffff };
-
-        std::span<size_t> image_as_aligned_eight_bytes{
-            span::bit_cast<size_t>(std::span<std::byte>{ section_data, section_size }),
-        };
-        size_t num_values_patched{};
-        for (size_t& value : image_as_aligned_eight_bytes)
-        {
-            if (value >= absolute_memory_range_lower && value <= absolute_memory_range_upper)
-            {
-                value = value - relocation_offset;
-                num_values_patched++;
-            }
-        }
-        logger.verbose("Patched {} addresses...", num_values_patched);
-    }
 }
 
 [[nodiscard]] expected<std::monostate> patch_main(Logger& logger,
@@ -844,10 +595,22 @@ void patch_absolute_addresses(Logger logger,
     constexpr std::string_view pattern_before_virtual_lock{ "\xba\x00\x00\x00\x40\x41\xb8\x00\x00\x00\x80"sv };
     if (std::byte* target_addr = find_pattern(executable, pattern_before_virtual_lock))
     {
-        // Find next call
-        target_addr = find_pattern(executable, "\xff"sv);
-        // Skip the call
-        target_addr += 6;
+        // The sequence we want to NOP is immediately after the anchor:
+        // MOV EDX, dword ptr [g_DataBundleSize]   8B 15 ** ** ** **   (6 bytes)
+        // LEA RCX, [g_DataBundle]                 48 8D 0D ** ** ** ** (7 bytes)
+        // CALL qword ptr [->VirtualLock]           FF 15 ** ** ** **   (6 bytes)
+        // Total: 19 bytes
+        //
+        // Search for the MOV EDX (8B 15) that immediately follows the anchor.
+        const std::span<std::byte> after_anchor{ target_addr, static_cast<size_t>(executable.data() + executable.size() - target_addr) };
+        target_addr = find_pattern(after_anchor, "\x8B\x15"sv);
+        if (target_addr == nullptr)
+        {
+            return Error{
+                "Could not patch main function (MOV EDX pattern not found)...",
+                FAILED_PATCHING_MAIN_FUNCTION,
+            };
+        }
 
         // Expected following instructions:
         // MOV EDX, dword ptr [g_DataBundleSize]
@@ -923,7 +686,7 @@ void patch_absolute_addresses(Logger logger,
                 image_section_headers,
                 &IMAGE_SECTION_HEADER::Name,
                 std::basic_string_view<BYTE>{ (unsigned char*)".text" });
-            const ptrdiff_t virtual_raw_offset{
+            const ptrdiff_t raw_to_rva_offset{
                 static_cast<ptrdiff_t>(text_section_header->VirtualAddress) - text_section_header->PointerToRawData
             };
 
@@ -940,14 +703,11 @@ void patch_absolute_addresses(Logger logger,
 
             // Convert to RVAs
             const ptrdiff_t data_bundle_size_rva{
-                (mov_data_bundle_size_addr + virtual_raw_offset + 7 + data_bundle_size_rel_offset) - executable.data()
+                (mov_data_bundle_size_addr + raw_to_rva_offset + 7 + data_bundle_size_rel_offset) - executable.data()
             };
             const ptrdiff_t data_bundle_ptr_rva{
-                (mov_data_bundle_ptr_addr + virtual_raw_offset + 7 + data_bundle_ptr_rel_offset) - executable.data()
+                (mov_data_bundle_ptr_addr + raw_to_rva_offset + 7 + data_bundle_ptr_rel_offset) - executable.data()
             };
-
-            // Data bundle always at beginning of .text section
-            const ptrdiff_t data_bundle_rva{ text_section_header->VirtualAddress };
 
             // TODO: Do we need to set DAT_162dd97b8, DAT_162dd97a0?
 
@@ -960,8 +720,18 @@ void patch_absolute_addresses(Logger logger,
                 "\xc3"                                         // RET
                 ""sv
             };
+            constexpr size_t empty_bundle_offset{ new_code.size() + 16 };
+            if (static_cast<size_t>(function_end - function_begin) < empty_bundle_offset + 8)
+            {
+                return Error{
+                    "Not enough space for empty bundle sentinel...",
+                    FAILED_PATCHING_BUNDLE_INIT_FUNCTION,
+                };
+            }
+
             std::memset(function_begin, '\x90', function_end - function_begin);
             std::memcpy(function_begin, new_code.data(), new_code.size());
+            std::memset(function_begin + empty_bundle_offset, 0, 8);
 
             // Get addresses of new instructions
             std::byte* new_mov_data_bundle_size_addr{ function_begin };
@@ -970,13 +740,14 @@ void patch_absolute_addresses(Logger logger,
 
             // Translate RVAs back into instruction-relative offsets
             const uint32_t mew_data_bundle_size_rel_offset{
-                static_cast<uint32_t>(executable.data() + data_bundle_size_rva - (new_mov_data_bundle_size_addr + virtual_raw_offset + 11))
+                static_cast<uint32_t>(executable.data() + data_bundle_size_rva - (new_mov_data_bundle_size_addr + raw_to_rva_offset + 11))
             };
             const uint32_t mew_data_bundle_rel_offset{
-                static_cast<uint32_t>(executable.data() + data_bundle_rva - (new_lea_data_bundle_addr + virtual_raw_offset + 7))
+                static_cast<uint32_t>(function_begin + raw_to_rva_offset + empty_bundle_offset -
+                                      (new_lea_data_bundle_addr + raw_to_rva_offset + 7))
             };
             const uint32_t mew_data_bundle_ptr_rel_offset{
-                static_cast<uint32_t>(executable.data() + data_bundle_ptr_rva - (new_mov_data_bundle_ptr_addr + virtual_raw_offset + 7))
+                static_cast<uint32_t>(executable.data() + data_bundle_ptr_rva - (new_mov_data_bundle_ptr_addr + raw_to_rva_offset + 7))
             };
 
             // Write the offsets to memory
@@ -1082,6 +853,52 @@ void write_binary(Logger& logger,
     WriteWholeFile(out_path, executable);
 }
 
+void strip_authenticode(Logger& logger,
+                        IMAGE_OPTIONAL_HEADER& image_optional_header)
+{
+    // The Authenticode signature is a blob appended after all sections.  It is
+    // pointed to by DataDirectory[SECURITY] using a *file offset* (not an RVA,
+    // uniquely among all data directories).  After we mutate and resize the
+    // binary the original signature no longer covers the right bytes, so Windows
+    // would reject it.  The simplest correct action is to zero the entry; the
+    // blob itself will be dropped when resize_executable truncates the file to
+    // the end of the last section.
+    IMAGE_DATA_DIRECTORY& security_dir{ image_optional_header.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY] };
+    if (security_dir.VirtualAddress != 0 || security_dir.Size != 0)
+    {
+        logger.verbose("Stripping Authenticode signature...");
+        security_dir.VirtualAddress = 0;
+        security_dir.Size = 0;
+    }
+}
+
+void recalculate_checksum(Logger& logger,
+                          std::vector<std::byte>& executable)
+{
+    // CheckSumMappedFile computes the PE checksum over an in-memory image.
+    // Windows enforces it for any binary that has CFG or code integrity enabled,
+    // and for any binary where the original CheckSum field was non-zero.
+    // We always recompute so the output is unconditionally valid.
+    logger.verbose("Recalculating PE checksum...");
+
+    DWORD header_sum{};
+    DWORD computed_sum{};
+    PIMAGE_NT_HEADERS nt_headers{ CheckSumMappedFile(
+        executable.data(),
+        static_cast<DWORD>(executable.size()),
+        &header_sum,
+        &computed_sum) };
+
+    if (nt_headers == nullptr)
+    {
+        logger.warning("CheckSumMappedFile failed ({}), leaving checksum as-is...", GetLastError());
+        return;
+    }
+
+    logger.verbose("Old checksum: {:#010x}, new checksum: {:#010x}", header_sum, computed_sum);
+    nt_headers->OptionalHeader.CheckSum = computed_sum;
+}
+
 int main(int argc, char* argv[])
 {
     try
@@ -1119,22 +936,21 @@ int main(int argc, char* argv[])
         BundleExtractionResult bundle_extraction_result{
             as_value(extract_bundle(logger,
                                     headers.image_optional_header,
+                                    headers.image_file_header,
                                     headers.image_section_headers,
                                     exe_data.data(),
-                                    options.debug_do_not_relocated.value_or(false)))
+                                    options.debug_do_not_relocate.value_or(false)))
         };
+
+        // Strip the Authenticode signature before patch_data_directory runs so it
+        // never sees DataDirectory[SECURITY] with a stale file offset.
+        strip_authenticode(logger, headers.image_optional_header);
 
         (void)as_value(patch_data_directory(logger,
                                             headers.image_optional_header,
                                             headers.image_section_headers,
-                                            bundle_extraction_result.text_section_start,
                                             bundle_extraction_result.relocation_offset,
                                             exe_data.data()));
-
-        patch_absolute_addresses(logger,
-                                 headers.image_section_headers,
-                                 bundle_extraction_result.relocation_offset,
-                                 exe_data.data());
 
         (void)as_value(patch_main(logger,
                                   exe_data,
@@ -1151,6 +967,9 @@ int main(int argc, char* argv[])
                                     bundle_extraction_result.relocation_offset));
 
         resize_executable(logger, headers.image_section_headers, exe_data);
+
+        // Checksum must be computed last, over the final byte sequence.
+        recalculate_checksum(logger, exe_data);
 
         const fs::path out_path{
             exe_path.parent_path() / options.output_name.value()

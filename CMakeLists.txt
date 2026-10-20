@@ -129,7 +129,8 @@ target_link_libraries(rip_and_tear PRIVATE
 	rip_and_tear_definitions
 	rip_and_tear_dependencies
 	rip_and_tear_pch
-	zstd::libzstd_static)
+	zstd::libzstd_static
+	imagehlp)
 target_include_directories(rip_and_tear PRIVATE "source/rip_and_tear" "res")
 
 # --------------------------------------------------
