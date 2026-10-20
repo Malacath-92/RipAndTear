@@ -27,6 +27,7 @@ struct CommandLineOptions
     std::optional<std::string> output_name{ "Mick2.exe" };
     std::optional<bool> insert_debug_interrupts{ false };
     std::optional<bool> debug_do_not_relocate{ false };
+    std::optional<bool> custom_code_patches{ false };
     std::optional<bool> extract_assets{ false };
     std::optional<int32_t> exit_reason;
     std::optional<bool> verbose{ false };
@@ -36,6 +37,7 @@ VISITABLE_STRUCT(CommandLineOptions,
                  output_name,
                  insert_debug_interrupts,
                  debug_do_not_relocate,
+                 custom_code_patches,
                  extract_assets,
                  exit_reason,
                  verbose);
@@ -853,14 +855,414 @@ void write_binary(Logger& logger,
     WriteWholeFile(out_path, executable);
 }
 
+[[nodiscard]] expected<std::monostate> patch_bundle_checksum(Logger& logger,
+                                                             std::span<std::byte> executable)
+{
+    using namespace std::string_view_literals;
+
+    logger.verbose("Patching v1.28 data bundle checksum check...");
+    auto patch_bundle_checksum_popper = logger.push_segment();
+
+    // v1.28 starts a worker thread which validates a ChaCha20 checksum of the
+    // encrypted data bundle. RipAndTear removes that bundle and makes the
+    // bundle init function create an empty one, so the validator always sees a
+    // mismatch and calls _Exit(0) before the first frame is drawn.
+    //
+    //     movabs rax, 0x6f018167ea9cd34a
+    //     cmp    rcx, rax
+    //     jne    <failure>
+    //
+    // NOP the conditional branch so execution always takes the success path.
+    constexpr std::string_view anchor{
+        "\x48\xb8\x4a\xd3\x9c\xea\x67\x81\x01\x6f\x48\x39\xc1\x75\x29"sv
+    };
+    std::byte* const checksum_check{ find_pattern(executable, anchor) };
+    if (checksum_check == nullptr)
+    {
+        return Error{
+            "Could not find data bundle checksum check...",
+            FAILED_PATCHING_BUNDLE_CHECKSUM,
+        };
+    }
+
+    const size_t remaining_size{
+        static_cast<size_t>(executable.data() + executable.size() - checksum_check)
+    };
+    if (remaining_size < anchor.size() ||
+        find_pattern(std::span<std::byte>{ checksum_check + 1, remaining_size - 1 },
+                     anchor) != nullptr)
+    {
+        return Error{
+            "Data bundle checksum check signature is ambiguous or malformed...",
+            FAILED_PATCHING_BUNDLE_CHECKSUM,
+        };
+    }
+
+    std::memset(checksum_check + 13, 0x90, 2);
+    logger.verbose("Neutralized v1.28 data bundle checksum validation...");
+    return std::monostate{};
+}
+
+[[nodiscard]] expected<std::monostate> patch_asset_reader(Logger& logger,
+                                                          IMAGE_OPTIONAL_HEADER& image_optional_header,
+                                                          std::span<IMAGE_SECTION_HEADER> image_section_headers,
+                                                          std::span<std::byte> executable)
+{
+    using namespace std::string_view_literals;
+
+    logger.verbose("Patching asset reader function...");
+    auto patch_asset_reader_popper = logger.push_segment();
+
+    // -------------------------------------------------------------------------
+    // Step 1: find openEncryptedFile
+    //
+    // Strategy derived from Overlunky's search for "read_encrypted_file":
+    //   1. Find `mov r8d, 0x4650`  (41 B8 50 46 00 00) after the bundle.
+    //      This immediate appears at the call site of openEncryptedFile.
+    //   2. Find the first `call` (E8) at or after that instruction.
+    //   3. Find the *next* `call` (E8) after that — this is the call to
+    //      openEncryptedFile.
+    //   4. Decode the near-call relative offset to get the function address:
+    //      target = call_site + 5 + *(int32_t*)(call_site + 1)
+    // -------------------------------------------------------------------------
+    constexpr std::string_view anchor{ "\x41\xB8\x50\x46\x00\x00"sv };
+
+    std::byte* anchor_match{ find_pattern(executable, anchor) };
+    if (anchor_match == nullptr)
+    {
+        return Error{
+            "Could not find openEncryptedFile anchor (mov r8d, 0x4650 not found)...",
+            FAILED_ASSET_READER_FUNCTION_NOT_FOUND,
+        };
+    }
+
+    // Find first call after the anchor
+    const std::span<std::byte> after_anchor{ anchor_match, static_cast<size_t>(executable.data() + executable.size() - anchor_match) };
+    std::byte* first_call{ find_pattern(after_anchor, "\xE8"sv) };
+    if (first_call == nullptr)
+    {
+        return Error{
+            "Could not find openEncryptedFile anchor (first call not found)...",
+            FAILED_ASSET_READER_FUNCTION_NOT_FOUND,
+        };
+    }
+
+    // Find second call (skip past the first one)
+    const std::span<std::byte> after_first_call{ first_call + 1, static_cast<size_t>(executable.data() + executable.size() - first_call - 1) };
+    std::byte* second_call{ find_pattern(after_first_call, "\xE8"sv) };
+    if (second_call == nullptr)
+    {
+        return Error{
+            "Could not find openEncryptedFile anchor (second call not found)...",
+            FAILED_ASSET_READER_FUNCTION_NOT_FOUND,
+        };
+    }
+
+    // Decode the near-call: target_file_offset = call_site + 5 + rel32
+    // The call instruction is in the file buffer; we need to convert its
+    // file offset to an RVA first so the arithmetic works in address space.
+    const IMAGE_SECTION_HEADER* text_section_header = algo::find(
+        image_section_headers,
+        &IMAGE_SECTION_HEADER::Name,
+        std::basic_string_view<BYTE>{ (unsigned char*)".text" });
+
+    const ptrdiff_t text_virtual_raw_offset{
+        static_cast<ptrdiff_t>(text_section_header->PointerToRawData) - text_section_header->VirtualAddress
+    };
+
+    const size_t call_site_file_offset{ static_cast<size_t>(second_call - executable.data()) };
+    const size_t call_site_rva{ call_site_file_offset - static_cast<size_t>(text_virtual_raw_offset) };
+    const int32_t rel32{ *reinterpret_cast<int32_t*>(second_call + 1) };
+    const size_t function_rva{ static_cast<size_t>(static_cast<int64_t>(call_site_rva) + 5 + rel32) };
+    const size_t function_file_offset{ function_rva + static_cast<size_t>(text_virtual_raw_offset) };
+    std::byte* function_begin{ executable.data() + function_file_offset };
+
+    logger.verbose("Found openEncryptedFile at file offset {:#x}, RVA {:#x}, VA {:#x}...",
+                   function_file_offset,
+                   function_rva,
+                   image_optional_header.ImageBase + function_rva);
+
+    // -------------------------------------------------------------------------
+    // Step 3: locate IAT slots for the five CRT functions
+    //
+    // Order matches the data section in the blob:
+    //   ftell[0], fseek[1], fread[2], fopen[3], fclose[4]
+    // -------------------------------------------------------------------------
+    constexpr std::array<std::string_view, 6> required_functions{ "ftell", "fseek", "fread", "fopen", "fclose", "malloc" };
+    std::array<uint64_t, 6> iat_vas{};
+    std::array<bool, 6> iat_found{};
+
+    const IMAGE_DATA_DIRECTORY& import_dir{ image_optional_header.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT] };
+    const ptrdiff_t import_virtual_raw_offset = [&]() -> ptrdiff_t
+    {
+        for (const IMAGE_SECTION_HEADER& sec : image_section_headers)
+        {
+            if (sec.VirtualAddress <= import_dir.VirtualAddress &&
+                sec.VirtualAddress + sec.Misc.VirtualSize > import_dir.VirtualAddress)
+            {
+                return static_cast<ptrdiff_t>(sec.PointerToRawData) - sec.VirtualAddress;
+            }
+        }
+        return 0;
+    }();
+
+    std::span<IMAGE_IMPORT_DESCRIPTOR> import_desc_table{
+        get_nullterminated_table<IMAGE_IMPORT_DESCRIPTOR>(
+            executable.data() + import_dir.VirtualAddress + import_virtual_raw_offset)
+    };
+
+    for (const IMAGE_IMPORT_DESCRIPTOR& desc : import_desc_table)
+    {
+        const ptrdiff_t hint_table_raw{ desc.OriginalFirstThunk + import_virtual_raw_offset };
+        std::span<IMAGE_THUNK_DATA> hint_table{
+            get_nullterminated_table<IMAGE_THUNK_DATA>(executable.data() + hint_table_raw)
+        };
+
+        for (size_t i = 0; i < hint_table.size(); ++i)
+        {
+            using THUNK_T = decltype(decltype(IMAGE_THUNK_DATA::u1)::AddressOfData);
+            constexpr THUNK_T ordinal_bit{ THUNK_T(1) << (sizeof(THUNK_T) * 8 - 1) };
+            if (hint_table[i].u1.AddressOfData & ordinal_bit)
+                continue;
+
+            const IMAGE_IMPORT_BY_NAME* name_entry{
+                reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(
+                    executable.data() + hint_table[i].u1.AddressOfData + import_virtual_raw_offset)
+            };
+            const std::string_view fn_name{ name_entry->Name };
+
+            for (size_t j = 0; j < required_functions.size(); ++j)
+            {
+                if (fn_name == required_functions[j])
+                {
+                    // VA of IAT slot = ImageBase + FirstThunk_RVA + index * 8
+                    iat_vas[j] = image_optional_header.ImageBase + desc.FirstThunk + i * sizeof(uint64_t);
+                    iat_found[j] = true;
+                    logger.verbose("Found IAT slot for '{}': VA {:#x}...", fn_name, iat_vas[j]);
+                }
+            }
+        }
+    }
+
+    for (size_t i = 0; i < required_functions.size(); ++i)
+    {
+        if (!iat_found[i])
+        {
+            return Error{
+                fmt::format("Could not find IAT slot for '{}'...", required_functions[i]),
+                FAILED_ASSET_READER_IAT_FUNCTION_NOT_FOUND,
+            };
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Step 4: write the replacement function blob
+    //
+    // Blob layout (320 bytes total):
+    //   [0..0x103]  function body ending with ret
+    //   [0x104..0x106] "rb\0" mode string
+    //   [0x107..0x10F] padding to 16-byte align the slot table
+    //   [0x110..0x13F] 6 x uint64 IAT offset slots: ftell, fseek, fread, fopen, fclose, malloc
+    //
+    // Each slot stores: IAT_slot_RVA - function_RVA, a base-independent displacement.
+    // -------------------------------------------------------------------------
+    // clang-format off
+    constexpr std::string_view blob{
+        "\x53\x55\x41\x54\x48\x83\xec\x20\x48\x8d\x15\xf5\x00\x00\x00\x48" // 000 push rbx/rbp/r12; sub rsp,0x20; lea rdx,[rip+mode]
+        "\x8d\x05\xea\xff\xff\xff\x48\x03\x05\x0b\x01\x00\x00\xff\x10\x48" // 010 lea rax,[rip-func]; add rax,[fopen]; call [rax]; mov rbp,rax
+        "\x89\xc5\x48\x85\xed\x74\xd2\x48\x89\xe9\x31\xd2\x41\xb8\x02\x00" // 020 test rbp,rbp; jz fail; mov rcx,rbp; xor edx,edx; mov r8d,2
+        "\x00\x00\x48\x8d\x05\xc7\xff\xff\xff\x48\x03\x05\xd8\x00\x00\x00" // 030 lea rax,[rip-func]; add rax,[fseek]; call [rax]
+        "\xff\x10\x48\x89\xe9\x48\x8d\x05\xb4\xff\xff\xff\x48\x03\x05\xbd" // 040 mov rcx,rbp; lea rax,[rip-func]; add rax,[ftell]
+        "\x00\x00\x00\xff\x10\x49\x89\xc4\x48\x89\xe9\x31\xd2\x45\x31\xc0" // 050 call [rax]; mov r12,rax; mov rcx,rbp; xor edx,edx; xor r8d,r8d
+        "\x48\x8d\x05\x99\xff\xff\xff\x48\x03\x05\xaa\x00\x00\x00\xff\x10" // 060 lea rax,[rip-func]; add rax,[fseek]; call [rax]
+        "\x49\x8d\x4c\x24\x20\x48\x8d\x05\x84\xff\xff\xff\x48\x03\x05\xb5" // 070 lea rcx,[r12+0x20]; lea rax,[rip-func]; add rax,[malloc]
+        "\x00\x00\x00\xff\x10\x48\x89\xc3\x48\x85\xdb\x74\x59\x48\x8d\x4b" // 080 call [rax]; mov rbx,rax; test rbx,rbx; jz close_fail; lea rcx,[rbx+0x20]
+        "\x20\xba\x01\x00\x00\x00\x4d\x89\xe0\x49\x89\xe9\x48\x8d\x05\x5d" // 090 mov edx,1; mov r8,r12; mov r9,rbp; lea rax,[rip-func]
+        "\xff\xff\xff\x48\x03\x05\x76\x00\x00\x00\xff\x10\x48\x89\xe9\x48" // 0a0 add rax,[fread]; call [rax]; mov rcx,rbp; lea rax,[rip-func]
+        "\x8d\x05\x4a\xff\xff\xff\x48\x03\x05\x73\x00\x00\x00\xff\x10\x48" // 0b0 add rax,[fclose]; call [rax]; mov rax,rbx
+        "\x89\xd8\x48\x8d\x48\x20\x48\x89\x08\xc7\x40\x08\x00\x00\x00\x00" // 0c0 lea rcx,[rax+0x20]; mov [rax],rcx; mov dword [rax+8],0
+        "\x44\x89\x60\x0c\x49\x8d\x4c\x24\x20\x48\x89\x48\x10\x48\x83\xc4" // 0d0 mov [rax+0xc],r12d; lea rcx,[r12+0x20]; mov [rax+0x10],rcx
+        "\x20\x41\x5c\x5d\x5b\xc3\x48\x89\xe9\x48\x8d\x05\x10\xff\xff\xff" // 0e0 add rsp,0x20; pop r12/rbp/rbx; ret; close_fail: mov rcx,rbp; lea rax,[rip-func]
+        "\x48\x03\x05\x39\x00\x00\x00\xff\x10\x31\xc0\x48\x83\xc4\x20\x41" // 0f0 add rax,[fclose]; call [rax]; fail: xor eax,eax; add rsp,0x20
+        "\x5c\x5d\x5b\xc3\x72\x62\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" // 100 pop r12/rbp/rbx; ret; "rb"; padding
+        "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" // 110 ftell slot, fseek slot
+        "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" // 120 fread slot, fopen slot
+        "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" // 130 fclose slot, malloc slot
+        ""sv
+    };
+    // clang-format on
+    static_assert(blob.size() == 320);
+
+    // Copy blob into a mutable buffer and fill in the IAT slots.
+    std::vector<std::byte> patched_blob(blob.size());
+    std::memcpy(patched_blob.data(), blob.data(), blob.size());
+
+    // The code adds each slot value to the runtime VA of this function, so the
+    // preferred image base must cancel out of the displacement.
+    // Order: ftell[0], fseek[1], fread[2], fopen[3], fclose[4], malloc[5]
+    constexpr size_t slot_base_offset{ 320 - required_functions.size() * sizeof(uint64_t) };
+    for (size_t i = 0; i < required_functions.size(); ++i)
+    {
+        const uint64_t slot_value{ iat_vas[i] - image_optional_header.ImageBase - function_rva };
+        logger.verbose("IAT slot [{}] '{}': {:#x}...", i, required_functions[i], slot_value);
+        std::memcpy(patched_blob.data() + slot_base_offset + i * sizeof(uint64_t),
+                    &slot_value,
+                    sizeof(uint64_t));
+    }
+
+    std::memcpy(function_begin, patched_blob.data(), patched_blob.size());
+
+    // -------------------------------------------------------------------------
+    // Step 5: replace the original unwind information.
+    //
+    // The original function and the replacement have completely different
+    // prologues. The preserves the .pdata entry, but that entry still
+    // describes the old function. Rewrite both its range and its unwind data.
+    // -------------------------------------------------------------------------
+    constexpr size_t replacement_code_size{ 0x104 };
+    static_assert(blob.size() > replacement_code_size);
+
+    const IMAGE_DATA_DIRECTORY& exception_dir{
+        image_optional_header.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION]
+    };
+    if (exception_dir.VirtualAddress == 0 || exception_dir.Size == 0)
+    {
+        return Error{
+            "Exception data directory is missing...",
+            FAILED_ASSET_READER_UNWIND_INFO,
+        };
+    }
+
+    const IMAGE_SECTION_HEADER* pdata_section{
+        find_section_for_rva(image_section_headers, exception_dir.VirtualAddress)
+    };
+    if (pdata_section == nullptr)
+    {
+        return Error{
+            "Exception data directory is not contained within a section...",
+            FAILED_ASSET_READER_UNWIND_INFO,
+        };
+    }
+
+    const ptrdiff_t pdata_virtual_raw_offset{
+        static_cast<ptrdiff_t>(pdata_section->PointerToRawData) - pdata_section->VirtualAddress
+    };
+    std::byte* const pdata_start{
+        executable.data() + exception_dir.VirtualAddress + pdata_virtual_raw_offset
+    };
+    std::span<IMAGE_RUNTIME_FUNCTION_ENTRY> runtime_functions{
+        get_nullterminated_table<IMAGE_RUNTIME_FUNCTION_ENTRY>(pdata_start)
+    };
+
+    IMAGE_RUNTIME_FUNCTION_ENTRY* loader_entry{ nullptr };
+    for (IMAGE_RUNTIME_FUNCTION_ENTRY& runtime_function : runtime_functions)
+    {
+        if (runtime_function.BeginAddress == function_rva)
+        {
+            loader_entry = &runtime_function;
+            break;
+        }
+    }
+    if (loader_entry == nullptr)
+    {
+        return Error{
+            fmt::format("Could not find .pdata entry for openEncryptedFile at RVA {:#x}...", function_rva),
+            FAILED_ASSET_READER_UNWIND_INFO,
+        };
+    }
+
+    // Unwind info is written in place, so make sure no other runtime function
+    // shares this record.
+    size_t unwind_info_references{};
+    for (const IMAGE_RUNTIME_FUNCTION_ENTRY& runtime_function : runtime_functions)
+    {
+        if (runtime_function.UnwindInfoAddress == loader_entry->UnwindInfoAddress)
+        {
+            ++unwind_info_references;
+        }
+    }
+    if (unwind_info_references != 1)
+    {
+        return Error{
+            fmt::format("openEncryptedFile shares unwind info with {} other functions...",
+                        unwind_info_references - 1),
+            FAILED_ASSET_READER_UNWIND_INFO,
+        };
+    }
+
+    const IMAGE_SECTION_HEADER* unwind_section{
+        find_section_for_rva(image_section_headers, loader_entry->UnwindInfoAddress)
+    };
+    if (unwind_section == nullptr)
+    {
+        return Error{
+            "Unwind info is not contained within a section...",
+            FAILED_ASSET_READER_UNWIND_INFO,
+        };
+    }
+
+    const ptrdiff_t unwind_virtual_raw_offset{
+        static_cast<ptrdiff_t>(unwind_section->PointerToRawData) - unwind_section->VirtualAddress
+    };
+    std::byte* const unwind_info_data{
+        executable.data() + loader_entry->UnwindInfoAddress + unwind_virtual_raw_offset
+    };
+
+    const UNWIND_INFO& old_unwind_info{ get_ref<UNWIND_INFO>(unwind_info_data) };
+    const size_t old_unwind_size{
+        4 + 2 * static_cast<size_t>((old_unwind_info.CountOfCodes + 1) & ~1) +
+        ((old_unwind_info.Flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER)) ? 8 : 0) +
+        ((old_unwind_info.Flags & UNW_FLAG_CHAININFO) ? 4 : 0)
+    };
+
+    // Version 1, no language-specific handler, prolog length 8, 4 codes:
+    //   sub rsp, 0x20; push r12; push rbp; push rbx
+    constexpr std::array<std::byte, 16> replacement_unwind{
+        std::byte{ 0x01 },
+        std::byte{ 0x08 },
+        std::byte{ 0x04 },
+        std::byte{ 0x00 },
+        std::byte{ 0x08 },
+        std::byte{ 0x32 },
+        std::byte{ 0x04 },
+        std::byte{ 0xC0 },
+        std::byte{ 0x02 },
+        std::byte{ 0x50 },
+        std::byte{ 0x01 },
+        std::byte{ 0x30 },
+        std::byte{ 0x00 },
+        std::byte{ 0x00 },
+        std::byte{ 0x00 },
+        std::byte{ 0x00 },
+    };
+
+    if (old_unwind_size < replacement_unwind.size())
+    {
+        return Error{
+            fmt::format("Existing unwind record is too small ({} bytes)...", old_unwind_size),
+            FAILED_ASSET_READER_UNWIND_INFO,
+        };
+    }
+
+    loader_entry->EndAddress = static_cast<DWORD>(function_rva + replacement_code_size);
+    std::memcpy(unwind_info_data, replacement_unwind.data(), replacement_unwind.size());
+
+    logger.verbose("Replaced openEncryptedFile unwind info ({} bytes, EndAddress {:#x})...",
+                   replacement_unwind.size(),
+                   loader_entry->EndAddress);
+
+    logger.verbose("Patched openEncryptedFile successfully...");
+    return std::monostate{};
+}
+
 void strip_authenticode(Logger& logger,
                         IMAGE_OPTIONAL_HEADER& image_optional_header)
 {
-    // The Authenticode signature is a blob appended after all sections.  It is
+    // The Authenticode signature is a blob appended after all sections. It is
     // pointed to by DataDirectory[SECURITY] using a *file offset* (not an RVA,
-    // uniquely among all data directories).  After we mutate and resize the
+    // uniquely among all data directories). After we mutate and resize the
     // binary the original signature no longer covers the right bytes, so Windows
-    // would reject it.  The simplest correct action is to zero the entry; the
+    // would reject it. The simplest correct action is to zero the entry; the
     // blob itself will be dropped when resize_executable truncates the file to
     // the end of the last section.
     IMAGE_DATA_DIRECTORY& security_dir{ image_optional_header.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY] };
@@ -952,14 +1354,26 @@ int main(int argc, char* argv[])
                                             bundle_extraction_result.relocation_offset,
                                             exe_data.data()));
 
-        (void)as_value(patch_main(logger,
-                                  exe_data,
-                                  options.insert_debug_interrupts.value_or(false)));
+        if (options.custom_code_patches)
+        {
+            (void)as_value(patch_main(logger,
+                                      exe_data,
+                                      options.insert_debug_interrupts.value_or(false)));
 
-        (void)as_value(patch_bundle_init(logger,
-                                         headers.image_section_headers,
-                                         exe_data,
-                                         options.insert_debug_interrupts.value_or(false)));
+            (void)as_value(patch_bundle_init(logger,
+                                             headers.image_section_headers,
+                                             exe_data,
+                                             options.insert_debug_interrupts.value_or(false)));
+
+            // The bundle is always removed by extract_bundle, so the v1.28
+            // checksum validator has to be neutralized for the result to run.
+            (void)as_value(patch_bundle_checksum(logger, exe_data));
+
+            (void)as_value(patch_asset_reader(logger,
+                                              headers.image_optional_header,
+                                              headers.image_section_headers,
+                                              exe_data));
+        }
 
         (void)as_value(debug_verify(logger,
                                     headers.image_section_headers,

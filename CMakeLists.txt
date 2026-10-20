@@ -198,7 +198,7 @@ endif()
 # Set debugging properties
 if(EXISTS ${SPELUNKY_INSTALL_DIR})
 	set_target_properties(rip_and_tear PROPERTIES
-		VS_DEBUGGER_COMMAND_ARGUMENTS "--verbose --exe_dir \"${SPELUNKY_INSTALL_DIR}\"")
+		VS_DEBUGGER_COMMAND_ARGUMENTS "--verbose --custom_code_patches --exe_dir \"${SPELUNKY_INSTALL_DIR}\"")
 else()
 	set_target_properties(rip_and_tear PROPERTIES
 		VS_DEBUGGER_COMMAND_ARGUMENTS "--verbose")
